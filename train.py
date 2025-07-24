@@ -24,7 +24,8 @@ import torch.distributed as tdist
 import infinity.utils.dist as dist
 from infinity.dataset.build import build_t2i_dataset
 from infinity.utils.save_and_load import CKPTSaver, auto_resume
-from infinity.utils import arg_util, misc, wandb_utils
+from infinity.utils import arg_util, misc
+from infinity.utils.wandb_utils import initialize as init_wandb, log_metrics, finish
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 
 enable_timeline_sdk = False
@@ -107,10 +108,13 @@ def build_model_optimizer(args, vae_ckpt):
 
     if args.rush_resume:
         print(f"{args.rush_resume=}")
-        cpu_d = torch.load(args.rush_resume, 'cpu')
-        if 'trainer' in cpu_d:
+        cpu_d = torch.load(args.rush_resume, 'cpu', weights_only=False)
+        if 'trainer' in cpu_d: #false
             state_dict = cpu_d['trainer']['gpt_fsdp']
             ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
+        elif 'gpt_fsdp' in cpu_d:
+            state_dict = cpu_d['gpt_fsdp']
+            ema_state_dict = cpu_d.get('gpt_ema_fsdp', state_dict)
         else:
             state_dict = cpu_d
             ema_state_dict = state_dict
@@ -326,7 +330,17 @@ def main_train(args: arg_util.Args):
     epochs_loss_nan = 0
     # build wandb logger
     if dist.is_master():
-        wandb_utils.wandb.init(project=args.project_name, name=args.exp_name, config={})
+        init_wandb(args, 
+              exp_name=args.exp_name, 
+              project_name=args.project_name)
+    
+        # 記錄模型參數數量
+        log_metrics({
+            'params/emb_params': PARA_EMB,
+            'params/align_params': PARA_ALN,
+            'params/other_params': PARA_OT,
+            'params/total_params': PARA_ALL
+        }, step=0)
     for ep in range(start_ep, args.ep):
         if ep % ep_lg == 0 or ep == start_ep:
             print(f'[PT info]  from ep{start_ep} it{start_it}, acc_str: {acc_str}, diffs: {args.diffs},    =======>  bed: {args.bed}  <=======\n')
@@ -508,6 +522,18 @@ def train_one_ep(
                     _, args.remain_time, args.finish_time = me.iter_time.time_preds(max_it - g_it + (args.ep - ep) * 15)      # +15: other cost
                     args.dump_log()
                     last_touch = time.time()
+
+                if dist.is_master():
+                    log_metrics({
+                        'train/loss_mean': me.meters['Lm'].median,
+                        'train/loss_tail': me.meters['Lt'].median,
+                        'train/acc_mean': me.meters['Accm'].median,
+                        'train/acc_tail': me.meters['Acct'].median,
+                        'train/learning_rate': me.meters['tlr'].median,
+                        'train/grad_norm': me.meters['tnm'].median,
+                        'train/epoch': ep,
+                        'train/iter': g_it,
+                    }, step=g_it)
                 
                 # [schedule learning rate]
                 wp_it = args.wp * iters_train
@@ -543,7 +569,11 @@ def main():     # # 'pt_le_ft' in train_vae.py is the same as 'pt_le_ft' in trai
     if dist.is_local_master(): misc.os_system(f'touch {wait1}')
     args: arg_util.Args = arg_util.init_dist_and_get_args()
     
-    main_train(args)
+    try:
+        main_train(args)
+    finally:
+        if dist.is_master():
+            finish()
     
     args.remain_time, args.finish_time = '-', time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - 60))
     args.cur_phase = 'OK'

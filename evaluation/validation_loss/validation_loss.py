@@ -83,7 +83,7 @@ if __name__ == '__main__':
                 print(f'{k}: {v}')
 
         pbar.update(1)
-        inp_B3HW, captions = data
+        inp_B3HW, condition_B3HW, captions = data
         tokens = text_tokenizer(text=captions, max_length=text_tokenizer.model_max_length, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
         input_ids = tokens.input_ids.cuda(non_blocking=True)
         mask = tokens.attention_mask.cuda(non_blocking=True)

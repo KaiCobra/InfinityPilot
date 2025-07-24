@@ -86,7 +86,7 @@ class Infinity(nn.Module):
         raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         head_depth=1,
         top_p=0.0, top_k=0.0,
-        customized_flash_attn=False, fused_mlp=False, fused_norm=False,
+        customized_flash_attn=False, fused_mlp=False, fused_norm=False, #modified
         block_chunks=1,
         checkpointing=None,
         pad_to_multiplier=0,
@@ -453,6 +453,37 @@ class Infinity(nn.Module):
         return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
 
     @torch.no_grad()
+    # ----------------------------------------------------------------------------------
+    # modified
+    # ----------------------------------------------------------------------------------
+    def setup_mask_processor(self, vae, scale_schedule, bitwise_self_correction):
+        """設置 mask 處理器"""
+        from infinity.utils.mask_utils import MaskFeatureProcessor
+        self.mask_processor = MaskFeatureProcessor(
+            vae,
+            scale_schedule=scale_schedule,
+            device=torch.device('cuda:0'),
+            other_args=self,
+            bitwise_self_correction=bitwise_self_correction
+        )
+        self.mask_path = None
+        self.mask_scale_idx = None
+        self.mask_method = 'weighted'
+        self.mask_alpha = 0.3
+
+    def set_mask(self, mask_path, scale_idx=[0,1,2,3,4,5,6,7,8,9,10,11], method='weighted', alpha=0.3, strength=None):
+        """設置要應用的 mask 和相關參數"""
+        self.mask_path = mask_path
+        self.mask_scale_idx = scale_idx
+        self.mask_method = method
+        self.mask_alpha = alpha
+        self.mask_strength = strength if strength is not None else [1.0] * (len(scale_idx)+1)
+        if mask_path:
+            # self.mask_processor.set_mask(mask_path)
+            pass
+    # ----------------------------------------------------------------------------------
+    # modified
+    # ----------------------------------------------------------------------------------
     def autoregressive_infer_cfg(
         self,
         vae=None,
@@ -566,37 +597,126 @@ class Infinity(nn.Module):
                         last_stage = torch.cat((last_stage, last_stage), 0)
                     layer_idx += 1
             
-            if (cfg != 1) and add_cfg_on_logits:
-                # print(f'add cfg on add_cfg_on_logits')
+            if (cfg != 1) and add_cfg_on_logits: # True
                 logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])
                 logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
             else:
                 logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
             
-            if self.use_bit_label:
-                tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
-                logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
+            if self.use_bit_label: #True
+                tmp_bs, tmp_seq_len = logits_BlV.shape[:2] # si=0: [1, 1, 64] si=1: [1, 4, 64]
+                logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2) # si=0: [1, 32, 2] si=1: [1, 128, 2]
                 idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
-                idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
+                idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1) # si=0: [1, 1, 32] si=1: [1, 4, 32]
             else:
                 idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
             if vae_type != 0:
                 assert returns_vemb
-                if si < gt_leak:
+                if si < gt_leak: # false
                     idx_Bld = gt_ls_Bl[si]
                 else:
                     assert pn[0] == 1
-                    idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1) # shape: [B, h, w, d] or [B, h, w, 4d]
+                    idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1) # shape: [B, h, w, d] or [B, h, w, 4d] si=3: [1,6,6,32]
                     if self.apply_spatial_patchify: # unpatchify operation
                         idx_Bld = idx_Bld.permute(0,3,1,2) # [B, 4d, h, w]
                         idx_Bld = torch.nn.functional.pixel_shuffle(idx_Bld, 2) # [B, d, 2h, 2w]
                         idx_Bld = idx_Bld.permute(0,2,3,1) # [B, 2h, 2w, d]
-                    idx_Bld = idx_Bld.unsqueeze(1) # [B, 1, h, w, d] or [B, 1, 2h, 2w, d]
+                    idx_Bld = idx_Bld.unsqueeze(1) # [B, 1, h, w, 32] si=3: [1,1,6,6,32]
 
                 idx_Bld_list.append(idx_Bld)
                 codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label') # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
+                # ----------------------------------------------------------------------------------
+                # modified
+                # ----------------------------------------------------------------------------------
+                # if si in getattr(self, 'mask_scale_idx', -1) and hasattr(self, 'mask_processor') and self.mask_path:
+                #     # 獲取當前特徵的空間尺寸
+                #     if codes.dim() == 5:
+                #         B, C, T, H, W = codes.shape
+                #         codes = codes.squeeze(2)
+                #     elif codes.dim() == 4:
+                #         B, C, H, W = codes.shape
+                #     else:
+                #         raise ValueError(f"Unexpected codes shape: {codes.shape}")
+
+                #     # 確保 mask 已經被設置
+                #     if not hasattr(self, 'mask'):
+                #         self.mask = self.mask_processor.set_mask(self.mask_path, si)
+                #     codes = self.mask
+                # ----------------------------------------------------------------------------------
+                # modified
+                # ----------------------------------------------------------------------------------
                 if si != num_stages_minus_1:
-                    summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
+                    #---------------------------------------------------------------------------------------------
+                    #text mask  
+                    #---------------------------------------------------------------------------------------------
+                    # strength = [0.9, 0.8, 0.75, 0.95, 1, 1, 1, 1, 0.7, 0.7, 0.9, 0.95] # text mask 1
+                    # strength = [0.8, 1, 0.95, 1, 0.6, 1, 1, 0.7, 0.9, 0.79, 0.89, 0.93] # text mask 2
+                    # strength = [0.2, 1, 1, 0.8, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 3
+                    # strength = [0.23, 0.95, 0.87, 1, 1, 0.99, 1, 1, 1, 1, 1, 1] # text mask 4
+                    # strength = [0.23, 0.6, 0.78, 0.99, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 5 very bad like input mask
+                    # strength = [0.23, 0.8, 0.9, 0.99, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 6
+                    # strength = [0.4, 0.75, 0.95, 1, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 7
+                    # strength = [0.95, 0.7, 0.8, 0.95, 0.99, 1, 1, 0.999, 0.89, 0.79, 0.895, 0.93] # no word
+                    #---------------------------------------------------------------------------------------------
+                    #normal map  
+                    #---------------------------------------------------------------------------------------------
+                    # strength = [0.5, 0.95, 1, 0.95, 0.99, 1, 1, 0.65, 0.89, 0.79, 0.895, 0.93] # normal map too strong(new) try1
+                    # strength = [0.5, 0.65, 1, 0.95, 0.99, 1, 1, 0.9, 0.85, 0.9, 0.92, 0.95] # normal try4
+                    # strength = [0.5, 0.5, 1, 1, 1, 1, 1, 0.92, 0.95, 0.93, 0.92, 0.95] # normal try5
+                    # strength = [0.65, 0.75, 1, 1, 1, 1, 1, 0.9, 0.9, 0.9, 0.92, 0.95] # normal try6
+                    # strength = [0.55, 0.7, 1, 1, 1, 1, 1, 0.88, 1, 1, 1, 1] # normal try7
+                    # strength = [0.35, 0.85, 1, 1, 1, 0.8, 1, 1, 1, 1, 1, 1] # normal try8
+                    # strength = [0.45, 0.95, 1, 1, 1, 0.9, 0.95, 1, 1, 1, 1, 1] # normal try9
+                    # strength = [0.40, 0.83, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try10
+                    # strength = [0.40, 0.87, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try11
+                    # strength = [0.40, 0.9, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try12
+                    # strength = [0.37, 0.9, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try13
+                    # strength = [0.40, 0.87, 0.95, 1, 0.88, 1, 1, 1, 1, 1, 1, 1] # normal try14
+                    # strength = [0.40, 0.87, 0.95, 0.88, 1, 1, 1, 1, 1, 1, 1, 1] # normal try15
+                    # strength = [0.3, 0.92, 0.95, 0.98, 1, 1, 1, 1, 1, 1, 1, 1] # normal try16
+                    # strength = [0.35, 0.95, 0.96, 0.98, 1, 1, 1, 1, 1, 1, 1, 1] # normal try17
+                    # strength = [0.35, 0.92, 0.97, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try18
+                    # strength = [0.2, 0.97, 0.98, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try19
+                    # strength = [0.23, 0.95, 0.97, 1, 1, 0.99, 1, 1, 1, 1, 1, 1] # normal try20
+                    # strength = [0.23, 0.95, 1, 0.99, 1, 1, 1, 1, 1, 1, 1, 1] # normal try21
+                    # strength = [0.15, 0.97, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try22
+                    # strength = [0.187, 0.935, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try23
+                    # strength = [0.5, 0.95, 0.97, 1, 1, 0.99, 1, 1, 1, 1, 1, 1] # normal try24
+                    # strength = [0.40, 0.87, 0.95, 1, 0.88, 1, 1, 1, 1, 1, 1, 1] # normal try14
+                    #---------------------------------------------------------------------------------------------
+                    # pure predict
+                    #---------------------------------------------------------------------------------------------
+                    # strength = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # original
+                    # strength = [0.35, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # gen hint
+                    # strength = [0.7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # gen hint2
+                    # strength = [0.35,0.97, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # gen hint scene3d
+                    # strength = [0.35, 0.7, 0.9, 0.95, 0.98, 1, 1, 1, 1, 1, 1, 1] # gen hint3
+                    #---------------------------------------------------------------------------------------------
+                    # txt edit
+                    #---------------------------------------------------------------------------------------------
+                    # strength = [0.6, 1, 0.93, 0.9, 0.75, 0.75, 1, 1, 0.8, 0.97, 0.99, 1.0] # edit 1
+                    # strength = [0.62, 1, 0.95, 0.92, 0.72, 0.8, 1, 1, 0.85, 0.97, 0.99, 1.0] # edit 2
+                    # strength = [0.62, 1, 0.95, 0.92, 0.8, 0.82, 1, 1, 0.87, 0.97, 0.97, 1.0] # edit 3
+                    # strength = [0.7, 1, 0.95, 1, 0.79, 0.82, 1, 1, 0.9, 0.97, 0.99, 1.0] # edit 4
+                    # strength = [0.55, 0.92, 0.85, 1, 1, 0.93, 1, 0.93, 1, 1, 1, 1] # edit 5 (with fake text and prompt)
+                    # strength = [0.55, 0.72, 0.80, 1, 1, 0.87, 1, 0.93, 1, 1, 1, 1] # edit 6 (with fake text no prompt)
+                    # strength = [0.5, 0.7, 0.80, 0.9, 0.87, 1, 1, 0.93, 1, 1, 1, 1] # edit 7 (with fake text no prompt)
+                    # strength = [0.3, 0.5, 1, 1, 1, 1, 1, 1, 0.85, 0.9, 0.95, 1] # edit 8 (with fake text no prompt)
+                    # strength = [0.3, 0.5, 1, 1, 1, 1, 1, 1, 0.80, 0.88, 0.92, 0.95] # edit 9 (with fake text no prompt)
+                    # strength = [0.5, 0.75, 0.90, 0.85, 1, 1, 1, 1, 1, 1, 1, 1] # edit 10 (with fake text and prompt)
+                    # strength = [0.7, 0.8, 0.90, 0.9, 0.9, 1, 1, 1, 1, 1, 1, 1] # edit 11 (with fake text and prompt)
+                    # strength = [0.7, 1, 0.92, 1, 1, 1, 1, 1, 0.96, 0.93, 1, 1] # edit 12 (with fake text and prompt) supreme!!
+                    # strength = [0.7, 1, 0.92, 1, 1, 1, 1, 1, 0.96, 0.93, 1, 1] # edit 13 (with fake text and prompt)
+                    strength = self.mask_strength
+                    
+                    if si in getattr(self, 'mask_scale_idx', -1):
+                        self.mask, self.mask_zeroed = self.mask_processor.set_mask(self.mask_path, si)
+                        mask_codes = self.mask
+                        codes = F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)*strength[si] + mask_codes*(1-strength[si])
+                        # codes = F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
+                        summed_codes += codes
+                    else:
+                        summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
                     last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up) # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
                     last_stage = last_stage.squeeze(-3) # [B, d, h, w] or [B, d, 2h, 2w]
                     if self.apply_spatial_patchify: # patchify operation
@@ -604,7 +724,12 @@ class Infinity(nn.Module):
                     last_stage = last_stage.reshape(*last_stage.shape[:2], -1) # [B, d, h*w] or [B, 4d, h*w]
                     last_stage = torch.permute(last_stage, [0,2,1]) # [B, h*w, d] or [B, h*w, 4d]
                 else:
+                    self.mask,_ = self.mask_processor.set_mask(self.mask_path, 12)
+                    mask_codes = self.mask
+                    # summed_codes = mask_codes # reconstruction
                     summed_codes += codes
+                    # summed_codes = mask_codes*0.1 + summed_codes*0.9
+                    print("mask set")
             else:
                 if si < gt_leak:
                     idx_Bl = gt_ls_Bl[si]

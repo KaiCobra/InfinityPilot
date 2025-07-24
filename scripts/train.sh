@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
+export USE_DISTRIBUTED=0
+export SINGLE=1
 
 set -x
 
-# set dist args
-# SINGLE=1
+# 设置分布式参数
 nproc_per_node=${ARNOLD_WORKER_GPU}
-
 if [ ! -z "$SINGLE" ] && [ "$SINGLE" != "0" ]; then
   echo "[single node alone] SINGLE=$SINGLE"
   nnodes=1
@@ -21,7 +21,7 @@ else
   master_addr=${!master_addr}
   master_port="METIS_WORKER_${MASTER_NODE_ID}_PORT"
   master_port=${!master_port}
-  ports=(`echo $master_port | tr ',' ' '`)
+  ports=( `echo $master_port | tr ',' ' '` )
   master_port=${ports[0]}
 fi
 
@@ -31,18 +31,17 @@ echo "[node_rank: ${node_rank}]"
 echo "[master_addr: ${master_addr}]"
 echo "[master_port: ${master_port}]"
 
-# set up envs
+# 环境变量设置
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=eth0
-
+# 使用回环接口确保单进程 torchrun 能初始化
+export NCCL_SOCKET_IFNAME=lo
 
 BED=checkpoints
 LOCAL_OUT=local_output
 mkdir -p $BED
 mkdir -p $LOCAL_OUT
-
 
 export COMPILE_GAN=0
 export USE_TIMELINE_SDK=1
@@ -50,9 +49,13 @@ export CUDA_TIMER_STREAM_KAFKA_CLUSTER=bmq_data_va
 export CUDA_TIMER_STREAM_KAFKA_TOPIC=megatron_cuda_timer_tracing_original_v2
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
+# TorchInductor 自动调优配置，确保至少有 ATEN 后端可选
+export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON,CPP,CUTLASS
+export TORCHINDUCTOR_AUTOTUNE_FALLBACK_TO_ATEN=1
+
 wandb offline
 exp_name=debug
-bed_path=checkpoints/${exp_name}/
+bed_path=$BED/${exp_name}/
 data_path='data/infinity_toy_data/splits'
 video_data_path=''
 local_out_path=$LOCAL_OUT/${exp_name}
@@ -60,63 +63,73 @@ local_out_path=$LOCAL_OUT/${exp_name}
 rm -rf ${bed_path}
 rm -rf ${local_out_path}
 
+# 使用 torchrun，无论单进程还是多进程，都初始化默认进程组
+if [ "$SINGLE" = "1" ]; then
+  echo ">>> 单卡模式，使用 torchrun 初始化分布式进程组"
+  nproc=1
+else
+  echo ">>> 多卡模式，使用 torchrun 初始化分布式进程组"
+  nproc=${nproc_per_node}
+fi
+
 torchrun \
---nproc_per_node=${nproc_per_node} \
---nnodes=${nnodes} \
---node_rank=${node_rank} \
---master_addr=${master_addr} \
---master_port=${master_port} \
-train.py \
---ep=100 \
---opt=adamw \
---cum=3 \
---sche=lin0 \
---fp16=2 \
---ada=0.9_0.97 \
---tini=-1 \
---tclip=5 \
---flash=0 \
---alng=5e-06 \
---saln=1 \
---cos=1 \
---enable_checkpointing=full-block \
---local_out_path ${local_out_path} \
---task_type='t2i' \
---bed=${bed_path} \
---data_path=${data_path} \
---video_data_path=${video_data_path} \
---exp_name=${exp_name} \
---tblr=6e-3 \
---pn 0.06M \
---model=2bc8 \
---lbs=4 \
---workers=8 \
---short_cap_prob 0.5 \
---online_t5=1 \
---use_streaming_dataset 1 \
---iterable_data_buffersize 30000 \
---Ct5=2048 \
---t5_path=weights/flan-t5-xl \
---vae_type 32 \
---vae_ckpt=weights/infinity_vae_d32_rdn_short.pth  \
---wp 0.00000001 \
---wpe=1 \
---dynamic_resolution_across_gpus 1 \
---enable_dynamic_length_prompt 1 \
---reweight_loss_by_scale 1 \
---add_lvl_embeding_only_first_block 1 \
---rope2d_each_sa_layer 1 \
---rope2d_normalized_by_hw 2 \
---use_fsdp_model_ema 0 \
---always_training_scales 100 \
---use_bit_label 1 \
---zero=2 \
---save_model_iters_freq 100 \
---log_freq=50 \
---checkpoint_type='torch' \
---prefetch_factor=16 \
---noise_apply_strength 0.3 \
---noise_apply_layers 13 \
---apply_spatial_patchify 0 \
---use_flex_attn=True \
---pad=128
+  --nproc_per_node=${nproc} \
+  --nnodes=${nnodes} \
+  --node_rank=${node_rank} \
+  --master_addr=${master_addr} \
+  --master_port=${master_port} \
+  train.py \
+  --ep=100 \
+  --opt=adamw \
+  --cum=3 \
+  --sche=lin0 \
+  --fp16=2 \
+  --ada=0.9_0.97 \
+  --tini=-1 \
+  --tclip=5 \
+  --flash=0 \
+  --alng=5e-06 \
+  --saln=1 \
+  --cos=1 \
+  --enable_checkpointing=full-block \
+  --local_out_path ${local_out_path} \
+  --task_type t2i \
+  --bed=${bed_path} \
+  --data_path= data/real_data/combined_splits_by_ratio \
+  --video_data_path=${video_data_path} \
+  --exp_name=${exp_name} \
+  --tblr=6e-3 \
+  --pn 0.06M \
+  --model 2bc8 \
+  --lbs=1 \
+  --workers=8 \
+  --short_cap_prob 0.5 \
+  --online_t5=1 \
+  --use_streaming_dataset 1 \
+  --iterable_data_buffersize 30000 \
+  --Ct5=2048 \
+  --t5_path=weights/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001 \
+  --rush_resume=weights/infinity_2b_reg.pth \
+  --vae_type 32 \
+  --vae_ckpt=weights/infinity_vae_d32_reg.pth \
+  --wp=0.00000001 \
+  --wpe=1 \
+  --dynamic_resolution_across_gpus 1 \
+  --enable_dynamic_length_prompt 1 \
+  --reweight_loss_by_scale 1 \
+  --add_lvl_embeding_only_first_block 1 \
+  --rope2d_each_sa_layer 1 \
+  --rope2d_normalized_by_hw 2 \
+  --use_fsdp_model_ema 0 \
+  --always_training_scales 7 \
+  --use_bit_label 1 \
+  --zero=2 \
+  --save_model_iters_freq 1000 \
+  --log_freq=50 \
+  --checkpoint_type torch \
+  --prefetch_factor=16 \
+  --noise_apply_strength 0.3 \
+  --noise_apply_layers 13 \
+  --apply_spatial_patchify 0 \
+  --use_flex_attn False \
+  --pad=128

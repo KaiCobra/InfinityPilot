@@ -136,7 +136,7 @@ def get_prompt_id(prompt):
 
 def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_fsdp'):
     print('[Save slim model]')
-    full_ckpt = torch.load(infinity_model_path, map_location=device)
+    full_ckpt = torch.load(infinity_model_path, map_location=device, weights_only=False)
     infinity_slim = full_ckpt['trainer'][key]
     # ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
     if not save_file:
@@ -176,13 +176,13 @@ def load_infinity(
 ):
     print(f'[Loading Infinity]')
     text_maxlen = 512
-    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
+    with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
         infinity_test: Infinity = Infinity(
             vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
             shared_aln=True, raw_scale_schedule=scale_schedule,
             checkpointing='full-block',
             customized_flash_attn=False,
-            fused_norm=True,
+            fused_norm=True, #modified
             pad_to_multiplier=128,
             use_flex_attn=use_flex_attn,
             add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
@@ -198,7 +198,9 @@ def load_infinity(
         print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
 
         if bf16:
-            for block in infinity_test.unregistered_blocks:
+            len(infinity_test.unregistered_blocks)
+            for b_idx, block in enumerate(infinity_test.unregistered_blocks):
+                b_idx
                 block.bfloat16()
 
         infinity_test.eval()
@@ -209,7 +211,14 @@ def load_infinity(
 
         print(f'[Load Infinity weights]')
         if checkpoint_type == 'torch':
-            state_dict = torch.load(model_path, map_location=device)
+            state_dict = torch.load(model_path, map_location=device, weights_only=False)
+            if 'trainer' in state_dict:
+                state_dict = state_dict['trainer']['gpt_fsdp']
+            elif 'gpt_fsdp' in state_dict:
+                # state_dict = state_dict['gpt_fsdp']
+                state_dict = state_dict.get('gpt_ema_fsdp', state_dict['gpt_fsdp'])
+            else:
+                state_dict = state_dict
             print(infinity_test.load_state_dict(state_dict))
         elif checkpoint_type == 'torch_shard':
             from transformers.modeling_utils import load_sharded_checkpoint

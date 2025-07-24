@@ -40,6 +40,8 @@ class BitwiseSelfCorrection(object):
             gt_all_bit_indices = []
             pred_all_bit_indices = []
             x_BLC_wo_prefix = []
+            diffusion_timesteps = len(vae_scale_schedule) 
+            noise_schedule = torch.linspace(0.99, 0.1, diffusion_timesteps)
             for si, (pt, ph, pw) in enumerate(vae_scale_schedule):
                 residual = codes_out - cum_var_input
                 if si != len(vae_scale_schedule)-1:
@@ -47,7 +49,17 @@ class BitwiseSelfCorrection(object):
                 quantized, _, bit_indices, loss = self.vae.quantizer.lfq(residual) # quantized shape: [B, d_vae, 1, h, w], bit_indices shape: [B,1,h,w,d_vae]
                 gt_all_bit_indices.append(bit_indices)
                 if si < self.noise_apply_layers:
-                    noise_apply_strength = np.random.randint(0, 100 * self.noise_apply_strength+1) * 0.01
+                    # noise_apply_strength = np.random.randint(0, 100 * self.noise_apply_strength+1) * 0.01
+                    # ----------------------------------------
+                    #             Diffusion Forcing
+                    # ----------------------------------------
+                    # 指數衰減，後面的尺度噪聲衰減更快
+                    # decay_rate = 0.9
+                    # scale_factor = decay_rate ** si
+                    # base_strength = self.noise_apply_strength * scale_factor + 0.01
+                    # noise_apply_strength = base_strength * (0.7 + 0.3 * np.random.rand())
+                    noise_apply_strength = noise_schedule[si] * self.noise_apply_strength
+
                     mask = torch.rand(*bit_indices.shape).to(device) < noise_apply_strength
                     pred_bit_indices = bit_indices.clone()
                     pred_bit_indices[mask] = 1 - pred_bit_indices[mask]

@@ -79,6 +79,16 @@ class CKPTSaver(object):
                 'acc_str':      self.acc_str,
                 'milestones':   self.eval_milestone,
             }, local_out_ckpt)
+            # torch.save({
+            #     'args':         args.state_dict(),
+            #     'gpt_training': args.gpt_training,
+            #     'gpt_fsdp':     trainer_state['gpt_fsdp'],
+            #     'arch':         args.model if args.gpt_training else args.vv,
+            #     'epoch':        next_ep,
+            #     'iter':         next_it,
+            #     'acc_str':      self.acc_str,
+            #     'milestones':   self.eval_milestone,
+            # }, local_out_ckpt)
             
             print(f'[CKPTSaver][rank00] start: {also_save_to=} {best_save_to=} {(next_ep == args.ep)=} {auto_save=}  |  see {local_out_ckpt}', flush=True)
             print(f'[CKPTSaver][rank00] dbg: {args.bed=}', flush=True)                
@@ -112,7 +122,7 @@ class CKPTSaver(object):
 def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], int, int, str, List[Tuple[float, float]], dict, dict]:
     info = []
     resume = ''
-    if args.auto_resume:
+    if args.auto_resume: #True
         for dd in (args.local_out_path, args.bed):
             all_ckpt = glob_with_epoch_iter(os.path.join(dd, pattern))
             if len(all_ckpt): break

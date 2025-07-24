@@ -210,7 +210,7 @@ class T2IIterableDataset(IterableDataset):
             total_unlearned_batches += generator_info['num_of_batches']
         self.total_unlearned_batches = total_unlearned_batches
         self.h_div_w_template_2_unlearned_batches = h_div_w_template_2_unlearned_batches
-        assert self.total_unlearned_batches == self.samples_div_gpus_workers_batchsize_2batches
+        # assert self.total_unlearned_batches == self.samples_div_gpus_workers_batchsize_2batches
 
     def _next_h_div_w_template(self,):
         while True:
@@ -259,8 +259,12 @@ class T2IIterableDataset(IterableDataset):
                     ret, model_input = self.prepare_model_input(json.loads(data_item)) # data_item[0] is row number of panda dataframe
                     if ret:
                         c_, h_, w_ = model_input[1].shape[-3:]
-                        if c_ != 3 or np.abs(h_/w_-float(h_div_w_template)) > 0.01:
-                            print(f'Croupt data item: {data_item}')
+                        if c_ != 3 or np.abs(h_/w_-float(h_div_w_template)) > 0.02:
+                            if c_ != 3:
+                                print(f'C_ channels error')
+                            if np.abs(h_/w_-float(h_div_w_template)) > 0.02:
+                                print(f'h/w error: {np.abs(h_/w_- float(h_div_w_template))}')
+                            # print(f'Croupt data item: {data_item}')
                         else:
                             batch_data.append(model_input)
                     del data_item

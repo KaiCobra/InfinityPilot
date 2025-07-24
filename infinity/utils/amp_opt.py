@@ -41,6 +41,13 @@ def per_param_clip_grad_norm_(parameters, thresh: float, stable=False, fp=None) 
     # if fp is not None: fp.write(f'[per_param_clip_grad_norm_:47] finished.\n'); fp.flush()
     return 0 if len(skipped) == 0 else math.log10(max(min(skipped), 1e-7)), max_grad
 
+def get_param_for_log(prefix: str, named_params) -> dict: # new added function for single GPU
+    stats = {}
+    for name, param in named_params:
+        if param.requires_grad:
+            data = param.data.flatten()
+            stats[f"{prefix}/{name}"] = [data.mean().item(), data.std().item()]
+    return stats
 
 class AmpOptimizer:
     def __init__(
@@ -119,7 +126,17 @@ class AmpOptimizer:
         if self.scaler is not None:
             self.scaler.scale(loss).backward(retain_graph=False, create_graph=False)  # retain_graph=retain_graph, create_graph=create_graph
         else:
-            loss.backward(retain_graph=False, create_graph=False)
+            with torch.autograd.detect_anomaly():
+                # print(f"Backward step - Loss: {loss.item()}, requires_grad: {loss.requires_grad}")
+                # # 檢查模型參數的梯度
+                # for name, param in self.model_maybe_fsdp.named_parameters():
+                #     if param.requires_grad and param.grad is not None:
+                #         print(f"Param {name}: grad_norm={param.grad.norm().item()}")
+                # open when v2
+                # if loss.dim() > 0:
+                #     loss = loss.mean()
+                # loss = loss.clone().detach().requires_grad_(True)
+                loss.backward(retain_graph=False, create_graph=False)
         # if self.fp is not None: self.fp.write(f'[backward_clip_step:131] [it{it}, g_it{g_it}] after backward\n'); self.fp.flush()
         
         # clip gradients then step optimizer

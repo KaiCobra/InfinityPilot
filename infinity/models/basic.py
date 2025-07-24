@@ -1,5 +1,5 @@
 """
-Definitions of blocks of VAR transformer model.
+Definitions of blocks of VAR transformer model. (basic.py)
 """
 
 import math

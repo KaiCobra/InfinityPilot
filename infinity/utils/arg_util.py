@@ -24,7 +24,7 @@ class Args(Tap):
     ds: str = 'oi'                      # only used in GPT training::load_viz_data & FID benchmark
     model: str = ''                     # for VAE training, 'b' or any other for GPT training
     short_cap_prob: float = 0.2         # prob for training with short captions
-    project_name: str = 'Infinity'      # name of wandb project
+    project_name: str = 'TextVAR'      # name of wandb project
     tf32: bool = True                   # whether to use TensorFloat32
     auto_resume: bool = True            # whether to automatically resume from the last checkpoint found in args.bed
     rush_resume: str = ''               # pretrained infinity checkpoint
