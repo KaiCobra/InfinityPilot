@@ -120,6 +120,14 @@ class AmpOptimizer:
     ) -> Tuple[torch.Tensor, Optional[float]]:
         # backward
         loss = loss.mul(self.r_accu)   # r_accu == 1.0 / n_gradient_accumulation
+        
+        # 檢查 loss 是否為 NaN 或 inf
+        if not torch.isfinite(loss):
+            print(f"[ERROR] Loss is not finite: {loss.item()}")
+            print(f"[ERROR] Loss contains nan: {torch.isnan(loss)}")
+            print(f"[ERROR] Loss contains inf: {torch.isinf(loss)}")
+            raise RuntimeError(f"Loss is not finite: {loss.item()}")
+        
         orig_norm = scaler_sc = None
         # if self.fp is not None:
         #     if g_it % 20 == 0: self.fp.seek(0); self.fp.truncate(0)
@@ -127,16 +135,76 @@ class AmpOptimizer:
             self.scaler.scale(loss).backward(retain_graph=False, create_graph=False)  # retain_graph=retain_graph, create_graph=create_graph
         else:
             with torch.autograd.detect_anomaly():
-                # print(f"Backward step - Loss: {loss.item()}, requires_grad: {loss.requires_grad}")
-                # # 檢查模型參數的梯度
-                # for name, param in self.model_maybe_fsdp.named_parameters():
-                #     if param.requires_grad and param.grad is not None:
-                #         print(f"Param {name}: grad_norm={param.grad.norm().item()}")
-                # open when v2
-                # if loss.dim() > 0:
-                #     loss = loss.mean()
-                # loss = loss.clone().detach().requires_grad_(True)
-                loss.backward(retain_graph=False, create_graph=False)
+                # 在反向傳播前檢查模型參數
+                nan_params = []
+                inf_params = []
+                for name, param in self.model_maybe_fsdp.named_parameters():
+                    if param.requires_grad:
+                        if torch.isnan(param).any():
+                            nan_params.append(name)
+                        if torch.isinf(param).any():
+                            inf_params.append(name)
+                
+                if nan_params:
+                    print(f"[ERROR] Found NaN in parameters: {nan_params}")
+                if inf_params:
+                    print(f"[ERROR] Found Inf in parameters: {inf_params}")
+                
+                try:
+                    loss.backward(retain_graph=False, create_graph=False)
+                except RuntimeError as e:
+                    print(f"[ERROR] Backward failed: {e}")
+                    print(f"[DEBUG] Loss value: {loss.item()}")
+                    print(f"[DEBUG] Loss requires_grad: {loss.requires_grad}")
+                    
+                    # Auto-fix: Check for problematic parameters and re-initialize them
+                    if "GeluBackward0" in str(e) or "nan values" in str(e):
+                        print("[FIX] Detected GELU backward NaN issue - attempting parameter fix...")
+                        
+                        # Fix parameters that might cause GELU issues
+                        fixed_count = 0
+                        for name, param in self.model_maybe_fsdp.named_parameters():
+                            if param.requires_grad:
+                                # Check for extreme values that could cause GELU issues
+                                if torch.abs(param).max() > 10.0:  # GELU becomes unstable with large inputs
+                                    print(f"[FIX] Clipping extreme values in parameter: {name}")
+                                    param.data.clamp_(-5.0, 5.0)  # Clip to safe range
+                                    fixed_count += 1
+                                elif torch.isnan(param).any() or torch.isinf(param).any():
+                                    print(f"[FIX] Reinitializing problematic parameter: {name}")
+                                    if 'bias' in name:
+                                        torch.nn.init.zeros_(param)
+                                    elif 'weight' in name:
+                                        if param.dim() >= 2:
+                                            torch.nn.init.xavier_uniform_(param)
+                                        else:
+                                            torch.nn.init.normal_(param, 0, 0.02)
+                                    else:
+                                        torch.nn.init.normal_(param, 0, 0.02)
+                                    fixed_count += 1
+                        
+                        print(f"[FIX] Fixed {fixed_count} parameters")
+                        
+                        # Try backward again with fixed parameters
+                        if fixed_count > 0:
+                            print("[FIX] Retrying backward pass...")
+                            try:
+                                loss.backward(retain_graph=False, create_graph=False)
+                                print("[FIX] Backward pass succeeded after parameter fixing")
+                            except RuntimeError as retry_e:
+                                print(f"[ERROR] Backward still failed after fixing: {retry_e}")
+                                raise retry_e
+                        else:
+                            raise e
+                    else:
+                        # 檢查反向傳播後的梯度
+                        for name, param in self.model_maybe_fsdp.named_parameters():
+                            if param.requires_grad and param.grad is not None:
+                                if torch.isnan(param.grad).any():
+                                    print(f"[ERROR] NaN gradient in {name}")
+                                if torch.isinf(param.grad).any():
+                                    print(f"[ERROR] Inf gradient in {name}")
+                        raise e
         # if self.fp is not None: self.fp.write(f'[backward_clip_step:131] [it{it}, g_it{g_it}] after backward\n'); self.fp.flush()
         
         # clip gradients then step optimizer

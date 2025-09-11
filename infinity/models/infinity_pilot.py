@@ -30,6 +30,23 @@ except:
     fused_ada_layer_norm, fused_ada_rms_norm = None, None
 
 from infinity.models.infinity import Infinity
+from infinity.utils.control_data_utils import numpy_to_pt, pil_to_numpy
+
+
+
+def get_control_for_each_scale(control_image, scale):
+    """
+    Get tensors for each scale from extracted tensor.
+    """
+    def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
+        return x.add(x).add_(-1)
+    c_tensors = []
+    c_images = []
+    for pn in scale:
+        c_res = control_image.resize((pn * 16, pn * 16))
+        c_images.append(c_res)
+        c_tensors.append(normalize_01_into_pm1(numpy_to_pt(pil_to_numpy(c_res))))
+    return c_images, c_tensors
 
 class MultiInpIdentity(nn.Module):
     def forward(self, x, *args, **kwargs):
@@ -72,308 +89,525 @@ class MultipleLayers(nn.Module):
                 h = m(h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
         return h
 
-class Infinity(nn.Module):
+class ControlConditionEmbedding(nn.Module):
     def __init__(
-        self, vae_local,
-        text_channels=0, text_maxlen=0,     # text-cond generation
-        selecting_idx=None,                 # class-cond generation
-        embed_dim=1024, depth=16, num_heads=16, mlp_ratio=4.,   # model's architecture
-        drop_rate=0., drop_path_rate=0.,    # drop out and drop path
-        norm_eps=1e-6, rms_norm=False,      # norm layer
-        shared_aln=False, head_aln=True,    # adaptive norm
-        cond_drop_rate=0.1,                 # for classifier-free guidance
-        rand_uncond=False,
-        cross_attn_layer_scale=-1., nm0=False, tau=1, cos_attn=True, swiglu=False,
-        raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
-        head_depth=1,
-        top_p=0.0, top_k=0.0,
-        customized_flash_attn=False, fused_mlp=False, fused_norm=False, #modified
-        block_chunks=1,
-        checkpointing=None,
-        pad_to_multiplier=0,
-        use_flex_attn=False,
-        batch_size=2,
-        add_lvl_embeding_only_first_block=1,
-        use_bit_label=1,
-        rope2d_each_sa_layer=0,
-        rope2d_normalized_by_hw=0,
-        pn=None,
-        train_h_div_w_list=None,
-        video_frames=1,
-        always_training_scales=20,
-        apply_spatial_patchify = 0,
-        inference_mode=False,
+        self,
+        conditioning_embedding_channels: int,
+        conditioning_channels: int = 3,
+        block_out_channels: Tuple[int, ...] = (64, 128, 256, 512, 1024),
     ):
-        # set hyperparameters
-        self.C = embed_dim
-        self.inference_mode = inference_mode
-        self.apply_spatial_patchify = apply_spatial_patchify
-        if self.apply_spatial_patchify:
-            self.d_vae = vae_local.embed_dim * 4
-        else:
-            self.d_vae = vae_local.embed_dim
-        self.use_bit_label = use_bit_label
-        self.codebook_dim = self.d_vae
-        self.V = (self.codebook_dim * 2) if self.use_bit_label else vae_local.vocab_size
-        self.bit_mask = vae_local.quantizer.lfq.mask if self.use_bit_label else None
-        self.Ct5 = text_channels
-        self.depth = depth
-        self.num_heads = num_heads
-        self.batch_size = batch_size
-        self.mlp_ratio = mlp_ratio
-        self.cond_drop_rate = cond_drop_rate
-        self.norm_eps = norm_eps
-        self.prog_si = -1
-        self.pn = pn
-        self.train_h_div_w_list = train_h_div_w_list if train_h_div_w_list else h_div_w_templates
-        self.video_frames = video_frames
-        self.always_training_scales = always_training_scales
-
-        assert add_lvl_embeding_only_first_block in [0,1]
-        self.add_lvl_embeding_only_first_block = add_lvl_embeding_only_first_block
-        assert rope2d_each_sa_layer in [0,1]
-        self.rope2d_each_sa_layer = rope2d_each_sa_layer
-        self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
-        print(f'self.codebook_dim: {self.codebook_dim}, self.add_lvl_embeding_only_first_block: {self.add_lvl_embeding_only_first_block}, \
-            self.use_bit_label: {self.use_bit_label}, self.rope2d_each_sa_layer: {rope2d_each_sa_layer}, self.rope2d_normalized_by_hw: {self.rope2d_normalized_by_hw}')
-        head_up_method = ''
-        word_patch_size = 1 if head_up_method in {'', 'no'} else 2
-        if word_patch_size > 1:
-            assert all(raw_pn % word_patch_size == 0 for raw_pn in raw_scale_schedule), f'raw_scale_schedule={raw_scale_schedule}, not compatible with word_patch_size={word_patch_size}'
-        
-        self.checkpointing = checkpointing
-        self.pad_to_multiplier = max(1, pad_to_multiplier)
-        
-        customized_kernel_installed = any('Infinity' in arg_name for arg_name in flash_attn_func.__code__.co_varnames)
-        self.customized_flash_attn = customized_flash_attn and customized_kernel_installed
-        if customized_flash_attn and not customized_kernel_installed:
-            import inspect, warnings
-            file_path = inspect.getsourcefile(flash_attn_func)
-            line_number = inspect.getsourcelines(flash_attn_func)[1]
-            info = (
-                f'>>>>>> Customized FlashAttention2 is not installed or compiled, but specified in args by --flash=1. Set customized_flash_attn = False. <<<<<<\n'
-                f'>>>>>> `flash_attn_func` is in [line {line_number}] [file {file_path}] <<<<<<\n'
-                f'>>>>>> {flash_attn_func.__code__.co_varnames=} <<<<<<\n'
-            )
-            warnings.warn(info, ImportWarning)
-            print(info, flush=True)
-        
-        self.raw_scale_schedule = raw_scale_schedule    # 'raw' means before any patchifying
-        self.first_l = 1
-        # solve top-p top-k sampling hyperparameters
-        self.top_p, self.top_k = max(min(top_p, 1), 0), (round(top_k * self.V) if 0 < top_k < 1 else round(top_k))
-        if self.top_p < 1e-5: self.top_p = 0
-        if self.top_k >= self.V or self.top_k <= 0: self.top_k = 0
-        
-        t = torch.zeros(dist.get_world_size(), device=dist.get_device())
-        t[dist.get_rank()] = float(flash_fused_op_installed)
-        dist.barrier()
-        dist.allreduce(t)
-        assert round(t.sum().item()) in {0, dist.get_world_size()}, f'flash_fused_op_installed: {t}'
-        
         super().__init__()
-        self.rng = torch.Generator(device=dist.get_device())
-        self.maybe_record_function = nullcontext
-        self.text_maxlen = text_maxlen
-        self.t2i = text_channels != 0
-        
-        # [inp & position embedding]
-        init_std = math.sqrt(1 / self.C / 3)
-        self.norm0_cond = nn.Identity()
-        if self.t2i:
-            self.selecting_idx = None
-            self.num_classes = 0
-            self.D = self.C
-            
-            cfg_uncond = torch.empty(self.text_maxlen, self.Ct5)
-            rng = torch.Generator(device='cpu')
-            rng.manual_seed(0)
-            torch.nn.init.trunc_normal_(cfg_uncond, std=1.2, generator=rng)
-            cfg_uncond /= self.Ct5 ** 0.5
-            if rand_uncond:
-                self.register_buffer('cfg_uncond', cfg_uncond)
-            else:
-                self.cfg_uncond = nn.Parameter(cfg_uncond)
-            
-            self.text_norm = FastRMSNorm(self.Ct5, elementwise_affine=True, eps=norm_eps)
-            self.text_proj_for_sos = TextAttentivePool(self.Ct5, self.D)
-            self.text_proj_for_ca = nn.Sequential(
-                nn.Linear(self.Ct5, self.D),
-                nn.GELU(approximate='tanh'),
-                nn.Linear(self.D, self.D),
-            )
-        else:   # class-label cond
-            if selecting_idx is None:
-                num_classes = 1000
-                print(f'======= WARNING: selecting_idx not specified, set to 1/{num_classes} @ {dist.get_device()} =======')
-                selecting_idx = torch.full((1, num_classes), fill_value=1/num_classes, dtype=torch.float32, device=dist.get_device())
-            self.selecting_idx = selecting_idx
-            self.num_classes = selecting_idx.shape[-1]
-            self.D = self.C
-            self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
-            nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
-        
-        self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
-        nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
-        if self.rope2d_each_sa_layer:
-            rope2d_freqs_grid = precompute_rope2d_freqs_grid(dim=self.C//self.num_heads, dynamic_resolution_h_w=dynamic_resolution_h_w, pad_to_multiplier=self.pad_to_multiplier, rope2d_normalized_by_hw=self.rope2d_normalized_by_hw)
-            self.rope2d_freqs_grid = rope2d_freqs_grid
-        else:
-            raise ValueError(f'self.rope2d_each_sa_layer={self.rope2d_each_sa_layer} not implemented')
-        self.lvl_embed = nn.Embedding(15, self.C)
-        nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
-        
-        # [input layers] input norm && input embedding
-        norm_layer = partial(FastRMSNorm if rms_norm else nn.LayerNorm, eps=norm_eps)
-        self.norm0_ve = norm_layer(self.d_vae) if nm0 else nn.Identity()
-        self.word_embed = nn.Linear(self.d_vae, self.C)
-        
-        # [shared adaptive layernorm mapping network]
-        self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False), SharedAdaLin(self.D, 6*self.C)) if shared_aln else nn.Identity()
-        
-        # fused norm
-        if fused_norm:
-            fused_norm_func = fused_ada_rms_norm if rms_norm else fused_ada_layer_norm
-            if fused_norm_func is not None: # pre-compile
-                B = 2
-                x = torch.randn(B, 1, self.C).requires_grad_(True)
-                scale = torch.randn(B, 1, self.C).mul_(0.01).requires_grad_(True)
-                shift = torch.randn(B, 1, self.C).mul_(0.01).requires_grad_(True)
-                # fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale, shift=shift).mean().backward()
-                del B, x, scale, shift
-        else:
-            fused_norm_func = None
-        
-        # [backbone and head]
-        self.use_flex_attn = use_flex_attn
-        self.attn_fn_compile_dict = {}
-        self.batch_size = batch_size
-        if self.use_flex_attn:
-            self.attn_fn_compile_dict = self.compile_flex_attn()
 
-        self.drop_path_rate = drop_path_rate
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # dpr means drop path rate (linearly increasing)
-        self.unregistered_blocks = []
-        for block_idx in range(depth):
-            block = (CrossAttnBlock if self.t2i else SelfAttnBlock)(
-                embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=cross_attn_layer_scale, cond_dim=self.D, act=True, shared_aln=shared_aln, norm_layer=norm_layer,
-                num_heads=num_heads, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[block_idx], tau=tau, cos_attn=cos_attn,
-                swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=fused_norm_func,
-                checkpointing_sa_only=self.checkpointing == 'self-attn',
-                use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-            )
-            self.unregistered_blocks.append(block)
-        
-        # [head]
-        V = self.V
-        if head_aln:
-            self.head_nm = AdaLNBeforeHead(self.C, self.D, act=True, norm_layer=norm_layer, fused_norm_func=fused_norm_func)
-            self.head = nn.Linear(self.C, V) if head_depth == 1 else nn.Sequential(nn.Linear(self.C, self.C, bias=True), nn.GELU(approximate='tanh'), nn.Linear(self.C, V))
-        else:
-            self.head_nm = MultiInpIdentity()
-            self.head = nn.Sequential(norm_layer(self.C), nn.Linear(self.C, V)) if head_depth == 1 else nn.Sequential(norm_layer(self.C), nn.Linear(self.C, self.C, bias=True), nn.GELU(approximate='tanh'), nn.Linear(self.C, V))
-        
-        self.num_block_chunks = block_chunks or 1
-        self.num_blocks_in_a_chunk = depth // block_chunks
-        print(f"{self.num_blocks_in_a_chunk=}, {depth=}, {block_chunks=}")
-        assert self.num_blocks_in_a_chunk * block_chunks == depth
-        if self.num_block_chunks == 1:
-            self.blocks = nn.ModuleList(self.unregistered_blocks)
-        else:
-            self.block_chunks = nn.ModuleList()
-            for i in range(self.num_block_chunks):
-                self.block_chunks.append(MultipleLayers(self.unregistered_blocks, self.num_blocks_in_a_chunk, i*self.num_blocks_in_a_chunk))
-        print(
-            f'\n[constructor]  ==== customized_flash_attn={self.customized_flash_attn} (using_flash={sum((b.sa.using_flash if self.t2i else b.attn.using_flash) for b in self.unregistered_blocks)}/{self.depth}), fused_mlp={fused_mlp} (fused_mlp={sum(b.ffn.fused_mlp_func is not None for b in self.unregistered_blocks)}/{self.depth}) ==== \n'
-            f'    [Infinity config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}, swiglu={swiglu} num_blocks_in_a_chunk={self.num_blocks_in_a_chunk}\n'
-            f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
-            end='\n\n', flush=True
-        )
+        self.conv_in = nn.Conv2d(conditioning_channels, block_out_channels[0], kernel_size=3, padding=1)
+
+        self.blocks = nn.ModuleList([])
+
+        for i in range(len(block_out_channels) - 1):
+            channel_in = block_out_channels[i]
+            channel_out = block_out_channels[i + 1]
+            self.blocks.append(nn.Conv2d(channel_in, channel_in, kernel_size=3, padding=1))
+            self.blocks.append(nn.Conv2d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
+
+        self.conv_out = nn.Conv2d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
+
+    def forward(self, conditioning):
+        embedding = self.conv_in(conditioning)
+        embedding = F.silu(embedding)
+
+        for block in self.blocks:
+            embedding = block(embedding)
+            embedding = F.silu(embedding)
+
+        embedding = self.conv_out(embedding)
+
+        return embedding
+
+
+class FP32_Layernorm(nn.LayerNorm):
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        origin_dtype = inputs.dtype
+        return F.layer_norm(inputs.float(), self.normalized_shape, self.weight.float(), self.bias.float(),
+                            self.eps).to(origin_dtype)
+
+
+class InfinityPilot(Infinity):
+    """
+    ## 🧑‍🚀InfinityPilot: surf beyond the infinity!🛰️
+    This is a variant of Infinity that can refer to the condition image and prompt text to generate images that imply to the conditions.
     
+    Like the ControlNet for diffusion models, it can be used to control the generation process.
 
-    def compile_flex_attn(self):
-        attn_fn_compile_dict = {}
-        for h_div_w in self.train_h_div_w_list:
-            h_div_w_template = h_div_w_templates[np.argmin(np.abs(float(h_div_w) - h_div_w_templates))]
-            full_scale_schedule = dynamic_resolution_h_w[h_div_w_template][self.pn]['scales']
-            if self.inference_mode:
-                apply_flex_attn_scales = list(range(1, 1+len(full_scale_schedule)))
-                mask_type = "infinity_infer_mask_with_kv_cache"
-                auto_padding = True
+    Args:
+        vae_local: VAE model or module used for image encoding/decoding.
+        text_channels (int, default=0): Number of text channels for text-conditioned generation.
+        text_maxlen (int, default=0): Maximum length of text input.
+        selecting_idx (Optional[int], default=None): Index for class-conditioned generation.
+        embed_dim (int, default=1024): Embedding dimension of the model.
+        depth (int, default=16): Number of transformer blocks (model depth).
+        num_heads (int, default=16): Number of attention heads.
+        mlp_ratio (float, default=4.0): Ratio of MLP hidden dimension to embedding dimension.
+        drop_rate (float, default=0.0): Dropout rate for regularization.
+        drop_path_rate (float, default=0.0): Drop path rate for stochastic depth.
+        norm_eps (float, default=1e-6): Epsilon value for normalization layers.
+        rms_norm (bool, default=False): If True, use RMSNorm instead of LayerNorm.
+        shared_aln (bool, default=False): If True, use shared adaptive layer normalization.
+        head_aln (bool, default=True): If True, use adaptive normalization in attention heads.
+        cond_drop_rate (float, default=0.1): Drop rate for classifier-free guidance.
+        rand_uncond (bool, default=False): If True, randomly use unconditional generation.
+        cross_attn_layer_scale (float, default=-1.0): Scaling factor for cross-attention layers.
+        nm0 (bool, default=False): Custom normalization flag.
+        tau (float, default=1): Temperature parameter for attention or sampling.
+        cos_attn (bool, default=True): If True, use cosine attention mechanism.
+        swiglu (bool, default=False): If True, use SwiGLU activation in MLPs.
+        raw_scale_schedule (tuple, default=(1,2,3,4,5,6,8,10,13,16)): Schedule for raw scaling across layers.
+        head_depth (int, default=1): Depth of the attention head module.
+        top_p (float, default=0.0): Nucleus sampling parameter (top-p).
+        top_k (float, default=0.0): Top-k sampling parameter.
+        customized_flash_attn (bool, default=False): If True, use customized FlashAttention.
+        fused_mlp (bool, default=False): If True, use fused MLP implementation.
+        fused_norm (bool, default=False): If True, use fused normalization implementation.
+        block_chunks (int, default=1): Number of chunks to split blocks for memory efficiency.
+        checkpointing (Optional[Any], default=None): Checkpointing strategy for memory saving.
+        pad_to_multiplier (int, default=0): Pad input to a multiple of this value.
+        use_flex_attn (bool, default=False): If True, use flexible attention mechanism.
+        batch_size (int, default=2): Batch size for training or inference.
+        add_lvl_embeding_only_first_block (int, default=1): If True, add level embedding only in the first block.
+        use_bit_label (int, default=1): If True, use bit-level labels.
+        rope2d_each_sa_layer (int, default=0): If True, apply 2D RoPE to each self-attention layer.
+        rope2d_normalized_by_hw (int, default=0): If True, normalize 2D RoPE by height/width.
+        pn (Optional[Any], default=None): Additional parameter, purpose defined by implementation.
+        train_h_div_w_list (Optional[list], default=None): List of height/width ratios for training.
+        video_frames (int, default=1): Number of video frames for video input.
+        always_training_scales (int, default=20): Number of scales always used during training.
+        apply_spatial_patchify (int, default=0): If True, apply spatial patchification.
+        inference_mode (bool, default=False): If True, set model to inference mode.
+    """
+    def __init__(self, infinity_base_model: Optional['Infinity'] = None, init_car_modules=True, freeze_infinity=True, **kwargs):
+        """
+        Args:
+            infinity_base_model: 預訓練的 Infinity 基礎模型，如果提供則會復制其參數
+            init_car_modules: 是否初始化 CAR 模塊
+            freeze_infinity: 是否凍結 Infinity 基礎模型的參數
+            **kwargs: 其他參數傳遞給 Infinity 父類
+        """
+        # 檢查 checkpoint 架構並自動調整參數
+        if infinity_base_model is not None:
+            if isinstance(infinity_base_model, dict):
+                state_dict = infinity_base_model
             else:
-                mask_type = 'var'
-                auto_padding = False
-                apply_flex_attn_scales = [min(self.always_training_scales, len(full_scale_schedule))]
-            for scales_num in apply_flex_attn_scales:
-                print(f'====== apply flex attn hdivw: {h_div_w} scales: {scales_num} ======')
-                scale_schedule = full_scale_schedule[:scales_num]
-                scale_schedule = [ (min(t, self.video_frames//4+1), h, w) for (t,h, w) in scale_schedule]
-                patchs_nums_tuple = tuple(scale_schedule)
-                SEQ_L = sum( pt * ph * pw for pt, ph, pw in patchs_nums_tuple)
-                aligned_L = SEQ_L+ (self.pad_to_multiplier - SEQ_L % self.pad_to_multiplier) if SEQ_L % self.pad_to_multiplier != 0 else SEQ_L
-                attn_fn = FlexAttn(block_scales = patchs_nums_tuple,
-                                        mask_type = mask_type,
-                                        B = self.batch_size, 
-                                        H = self.num_heads,
-                                        L = aligned_L,
-                                        auto_padding=auto_padding)
-                attn_fn_compile_dict[patchs_nums_tuple] = attn_fn
-
-            if self.video_frames > 1: # append image attn_fn when self.video_frames > 1 (namely videos)
-                scale_schedule = [ (1, h, w) for (t,h, w) in scale_schedule]
-                patchs_nums_tuple = tuple(scale_schedule)
-                SEQ_L = sum( pt * ph * pw for pt, ph, pw in patchs_nums_tuple)
-                aligned_L = SEQ_L+ (self.pad_to_multiplier - SEQ_L % self.pad_to_multiplier) if SEQ_L % self.pad_to_multiplier != 0 else SEQ_L
-                attn_fn = FlexAttn(block_scales = patchs_nums_tuple,
-                                        mask_type = mask_type,
-                                        B = self.batch_size, 
-                                        H = self.num_heads,
-                                        L = aligned_L)
-                attn_fn_compile_dict[patchs_nums_tuple] = attn_fn
-        return attn_fn_compile_dict
+                state_dict = infinity_base_model.state_dict() if hasattr(infinity_base_model, 'state_dict') else infinity_base_model
+            
+            # 檢測參數格式來自動設置架構
+            has_ada_gss = any('ada_gss' in k for k in state_dict.keys())
+            has_shared_ada_lin = any('shared_ada_lin' in k for k in state_dict.keys())
+            has_individual_ada_lin = any('ada_lin' in k and 'shared_ada_lin' not in k for k in state_dict.keys())
+            
+            print(f"[InfinityPilot] Checkpoint architecture detection:")
+            print(f"  - ada_gss: {has_ada_gss}")
+            print(f"  - shared_ada_lin: {has_shared_ada_lin}")
+            print(f"  - individual ada_lin: {has_individual_ada_lin}")
+            
+            # 根據檢測結果自動設置 shared_aln
+            if has_ada_gss or has_shared_ada_lin:
+                kwargs['shared_aln'] = True
+                print(f"[InfinityPilot] Auto-setting shared_aln=True to match checkpoint")
+            elif has_individual_ada_lin:
+                kwargs['shared_aln'] = False
+                print(f"[InfinityPilot] Auto-setting shared_aln=False to match checkpoint")
+            else:
+                print(f"[InfinityPilot] Could not detect ada_lin format, using default shared_aln={kwargs.get('shared_aln', False)}")
         
-    def get_logits(self, h: torch.Tensor, cond_BD: Optional[torch.Tensor]):
-        """
-        :param h: hidden_state, shaped (B or batch_size, L or seq_len, C or hidden_dim)
-        :param cond_BD: shaped (B or batch_size, D or cond_dim)
-        :param tau: temperature
-        :return: logits, shaped (B or batch_size, V or vocabulary_size)
-        """
-        with torch.amp.autocast('cuda', enabled=False):
-            return self.head(self.head_nm(h.float(), cond_BD.float()))
-
-    def add_lvl_embeding(self, feature, scale_ind, scale_schedule, need_to_pad=0):
-        bs, seq_len, c = feature.shape
-        patch_t, patch_h, patch_w = scale_schedule[scale_ind]
-        t_mul_h_mul_w = patch_t * patch_h * patch_w
-        assert t_mul_h_mul_w + need_to_pad == seq_len
-        feature[:, :t_mul_h_mul_w] += self.lvl_embed(scale_ind*torch.ones((bs, t_mul_h_mul_w),dtype=torch.int).to(feature.device))
-        return feature
+        # 保存所需的參數以便在建立控制塊時使用
+        self._init_kwargs = kwargs.copy()
+        
+        print(f"[InfinityPilot] Initializing with shared_aln={kwargs.get('shared_aln', False)}")
+        super().__init__(**kwargs)
+        
+        self.num_block_chunks = kwargs.get('block_chunks', 16)
+        
+        if infinity_base_model is not None:
+            self.load_infinity_weights(infinity_base_model)
+        
+        # 凍結 Infinity 基礎模型參數
+        if freeze_infinity:
+            self.freeze_infinity_parameters()
+        
+        if init_car_modules:
+            self._init_car_modules()
     
-    def add_lvl_embeding_for_x_BLC(self, x_BLC, scale_schedule, need_to_pad=0):
-        ptr = 0
-        x_BLC_list = []
-        for scale_ind, patch_t_h_w in enumerate(scale_schedule):
-            scale_seq_len = np.array(patch_t_h_w).prod()
-            x_BLC_this_scale = x_BLC[:,ptr:ptr+scale_seq_len] # shape: [bs, patch_h*patch_w, c]
-            ptr += scale_seq_len
-            x_BLC_this_scale = self.add_lvl_embeding(x_BLC_this_scale, scale_ind, scale_schedule)
-            x_BLC_list.append(x_BLC_this_scale)
-        assert x_BLC.shape[1] == (ptr + need_to_pad), f'{x_BLC.shape[1]} != {ptr} + {need_to_pad}'
-        x_BLC_list.append(x_BLC[:,ptr:])
-        x_BLC = torch.cat(x_BLC_list, dim=1)
-        return x_BLC
+    def load_infinity_weights(self, infinity_model_or_state_dict):
+        """從預訓練的 Infinity 模型載入權重，只載入非CAR模塊"""
+        if isinstance(infinity_model_or_state_dict, dict):
+            infinity_state_dict = infinity_model_or_state_dict
+        else:
+            infinity_state_dict = infinity_model_or_state_dict.state_dict()
+        
+        # 檢查是否為 FSDP 格式並轉換
+        if any(key.startswith('block_chunks.') for key in infinity_state_dict.keys()):
+            print("[INFO] Detected FSDP format weights, converting to standard format...")
+            infinity_state_dict = self._convert_fsdp_to_standard_format(infinity_state_dict)
+        
+        # 過濾出只有Infinity基礎模型的權重（排除CAR相關）
+        filtered_dict = {}
+        for name, param in infinity_state_dict.items():
+            # 跳過CAR相關的參數
+            if self._is_car_parameter(name):
+                continue
+            filtered_dict[name] = param
+        
+        # 獲取當前模型的非CAR參數名稱用於調試
+        current_infinity_params = {name for name, _ in self.named_parameters() 
+                                 if not self._is_car_parameter(name)}
+        source_infinity_params = set(filtered_dict.keys())
+
+        sorted_source_infinity_params = sorted(source_infinity_params)
+        sorted_current_infinity_params = sorted(current_infinity_params)
+
+        # 調試信息：檢查哪些參數缺失
+        missing_in_target = source_infinity_params - current_infinity_params
+        missing_in_source = current_infinity_params - source_infinity_params
+        
+        # sort the name of missing parameters for better readability
+        missing_in_target = sorted(missing_in_target)
+        missing_in_source = sorted(missing_in_source)
+
+        if len(missing_in_source) > 10:  # 如果缺失太多，顯示詳細信息
+            print(f"Debug: Parameters in source but not in target: {len(missing_in_target)}")
+            print(f"Debug: Parameters in target but not in source: {len(missing_in_source)}")
+            
+            # 顯示一些範例
+            if missing_in_source:
+                print(f"Sample missing in source: {list(missing_in_source)[:]}")
+            if missing_in_target:
+                print(f"Sample unexpected in source: {list(missing_in_target)[:]}")
+        
+        # 載入基礎模型權重
+        missing_keys, unexpected_keys = self.load_state_dict(filtered_dict, strict=False)
+        
+        # 過濾掉CAR相關的missing keys（這些是正常的）
+        real_missing = [k for k in missing_keys if not self._is_car_parameter(k)]
+        
+        # 統計不同類型的缺失參數
+        ada_lin_missing = [k for k in real_missing if 'ada_lin' in k]
+        zero_bias_missing = [k for k in real_missing if 'zero_k_bias' in k or 'zero_v_bias' in k]
+        other_missing = [k for k in real_missing if 'ada_lin' not in k and 'zero_k_bias' not in k and 'zero_v_bias' not in k]
+        
+        print(f"Loaded Infinity base weights: {len(filtered_dict) - len(real_missing)}/{len(filtered_dict)}")
+        if real_missing:
+            print(f"Missing base model keys: {len(real_missing)}")
+            if ada_lin_missing:
+                print(f"  - AdaLIN related: {len(ada_lin_missing)} (model version difference)")
+            if zero_bias_missing:
+                print(f"  - Zero bias related: {len(zero_bias_missing)} (attention config difference)")
+            if other_missing:
+                print(f"  - Other missing: {len(other_missing)}")
+                if len(other_missing) <= 5:
+                    print(f"    Details: {other_missing}")
+        
+        # 如果只是配置差異的參數缺失，這是正常的
+        config_diff_missing = len(ada_lin_missing) + len(zero_bias_missing)
+        if config_diff_missing == len(real_missing):
+            print("✓ All missing parameters are due to model configuration differences - this is normal")
+        elif len(real_missing) < len(filtered_dict) * 0.1:  # 少於10%缺失是可接受的
+            print("✓ Missing parameters are within acceptable range")
+        else:
+            print("⚠ Significant parameter mismatch - please verify model compatibility")
+            
+        return real_missing, unexpected_keys
+
+    def save_separated_weights(self, save_dir):
+        """分別保存Infinity基礎權重和CAR權重，T5風格"""
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 分離權重
+        infinity_weights = {}
+        car_weights = {}
+        
+        for name, param in self.state_dict().items():
+            if self._is_car_parameter(name):
+                car_weights[name] = param
+            else:
+                infinity_weights[name] = param
+        
+        # 保存
+        torch.save(infinity_weights, os.path.join(save_dir, 'infinity_base_weights.pth'))
+        torch.save(car_weights, os.path.join(save_dir, 'car_weights.pth'))
+        
+        print(f"Saved separated weights:")
+        print(f"  Infinity base: {len(infinity_weights)} parameters")
+        print(f"  CAR modules: {len(car_weights)} parameters")
+        return save_dir
+
+    def load_separated_weights(self, save_dir):
+        """載入分離的權重"""
+        import os
+        
+        # 載入Infinity基礎權重
+        infinity_path = os.path.join(save_dir, 'infinity_base_weights.pth')
+        if os.path.exists(infinity_path):
+            infinity_weights = torch.load(infinity_path, map_location='cpu')
+            self.load_state_dict(infinity_weights, strict=False)
+            print(f"Loaded Infinity base weights: {len(infinity_weights)} parameters")
+        
+        # 載入CAR權重
+        car_path = os.path.join(save_dir, 'car_weights.pth')
+        if os.path.exists(car_path):
+            car_weights = torch.load(car_path, map_location='cpu')
+            self.load_state_dict(car_weights, strict=False)
+            print(f"Loaded CAR weights: {len(car_weights)} parameters")
+
+    def _convert_fsdp_to_standard_format(self, fsdp_state_dict):
+        """將 FSDP 格式的權重轉換為標準格式 (內存優化版)
+        
+        FSDP 格式: block_chunks.X.module.Y.xxx
+        標準格式: blocks.Z.xxx (其中 Z = X * chunk_size + Y)
+        """
+        converted_dict = {}
+        chunk_size = 4  # 假設每個 chunk 有 4 個 block（根據錯誤信息推測）
+        fsdp_keys_to_process = []
+        
+        # 首先收集需要轉換的鍵，避免在迭代時修改字典
+        for key in fsdp_state_dict.keys():
+            if key.startswith('block_chunks.'):
+                fsdp_keys_to_process.append(key)
+            else:
+                # 非 block_chunks 的鍵，直接保留（避免內存複製）
+                converted_dict[key] = fsdp_state_dict[key]
+        
+        # 批量處理 FSDP 格式的鍵，節省內存
+        conversion_count = 0
+        for key in fsdp_keys_to_process:
+            # 解析 FSDP 格式的鍵
+            # 格式: block_chunks.X.module.Y.rest_of_path
+            parts = key.split('.')
+            if len(parts) >= 4 and parts[2] == 'module':
+                try:
+                    chunk_idx = int(parts[1])  # X
+                    block_idx = int(parts[3])  # Y
+                    rest_path = '.'.join(parts[4:])  # rest_of_path
+                    
+                    # 計算實際的 block 索引
+                    actual_block_idx = chunk_idx * chunk_size + block_idx
+                    
+                    # 生成標準格式的鍵並移動權重（避免複製）
+                    new_key = f'blocks.{actual_block_idx}.{rest_path}'
+                    converted_dict[new_key] = fsdp_state_dict[key]
+                    conversion_count += 1
+                except (ValueError, IndexError) as e:
+                    # 無法解析的鍵，保持原樣
+                    print(f"Warning: Could not parse FSDP key {key}: {e}")
+                    converted_dict[key] = fsdp_state_dict[key]
+            else:
+                # 無法解析的鍵，保持原樣
+                converted_dict[key] = fsdp_state_dict[key]
+        
+        print(f"[INFO] Converted {conversion_count} FSDP block parameters to standard format")
+        
+        # 清理原始字典的引用以釋放內存
+        fsdp_state_dict.clear()
+        return converted_dict
+
+    def _is_car_parameter(self, param_name):
+        """判斷參數是否屬於CAR模塊"""
+        car_prefixes = ['car_', 'control_']
+        return any(param_name.startswith(prefix) for prefix in car_prefixes)
+    
+    def freeze_infinity_parameters(self):
+        """凍結 Infinity 基礎模型的參數"""
+        frozen_count = 0
+        for name, param in self.named_parameters():
+            # 不凍結 CAR 相關的參數
+            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                param.requires_grad = False
+                frozen_count += 1
+        print(f"Frozen {frozen_count} Infinity base model parameters")
+    
+    def unfreeze_infinity_parameters(self):
+        """解凍 Infinity 基礎模型的參數"""
+        unfrozen_count = 0
+        for name, param in self.named_parameters():
+            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                param.requires_grad = True
+                unfrozen_count += 1
+        print(f"Unfrozen {unfrozen_count} Infinity base model parameters")
+
+    def _init_car_modules(self):
+        """初始化 CAR 控制模塊"""
+        # CAR control modules - 參考 CAR 的架構
+        conv_in_kernel = 3
+        conv_in_padding = (conv_in_kernel - 1) // 2
+        self.car_control_convs = ControlConditionEmbedding(conditioning_embedding_channels=self.C)
+        self.car_var_conv = nn.Conv2d(self.C, self.C, kernel_size=conv_in_kernel, padding=conv_in_padding)
+
+        # 建立 CAR 控制塊 - 只建立 depth//2 個塊（與 CAR 一致）
+        from functools import partial
+        
+        # Get parameters from kwargs or use defaults
+        init_kwargs = getattr(self, '_init_kwargs', {})
+        norm_layer = partial(FastRMSNorm if init_kwargs.get('rms_norm', False) else nn.LayerNorm, eps=init_kwargs.get('norm_eps', 1e-6))
+        self.car_depth = getattr(self, 'car_depth', init_kwargs.get('car_depth', 8))
+        depth = getattr(self, 'depth', init_kwargs.get('depth', 16))
+        dpr = [x.item() for x in torch.linspace(0, init_kwargs.get('drop_path_rate', 0.0), depth)]
+        
+        self.car_blocks = nn.ModuleList([
+            (CrossAttnBlock if self.t2i else SelfAttnBlock)(
+                embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=init_kwargs.get('cross_attn_layer_scale', -1.), 
+                cond_dim=self.D, act=True, shared_aln=init_kwargs.get('shared_aln', False), norm_layer=norm_layer,
+                num_heads=init_kwargs.get('num_heads', 16), mlp_ratio=init_kwargs.get('mlp_ratio', 4.), 
+                drop=init_kwargs.get('drop_rate', 0.), drop_path=dpr[block_idx], tau=init_kwargs.get('tau', 1), 
+                cos_attn=init_kwargs.get('cos_attn', True), swiglu=init_kwargs.get('swiglu', False), 
+                customized_flash_attn=getattr(self, 'customized_flash_attn', False), fused_mlp=init_kwargs.get('fused_mlp', False), 
+                fused_norm_func=getattr(self, '_fused_norm_func', None),
+                checkpointing_sa_only=getattr(self, 'checkpointing', None) == 'self-attn',
+                use_flex_attn=init_kwargs.get('use_flex_attn', False), batch_size=init_kwargs.get('batch_size', 2), 
+                pad_to_multiplier=init_kwargs.get('pad_to_multiplier', 0), 
+                rope2d_normalized_by_hw=init_kwargs.get('rope2d_normalized_by_hw', 0),
+            )
+            for block_idx in range(self.car_depth)
+        ])
+
+        # 建立跳躍連接的歸一化和線性層（與 CAR 一致）
+        car_norm_layer = FP32_Layernorm
+        car_skip_norm = []
+        car_skip_linear = []
+        for _ in range(self.car_depth):
+            car_skip_norm.append(car_norm_layer(2 * self.C, elementwise_affine=True, eps=1e-6))
+            car_skip_linear.append(nn.Linear(2 * self.C, self.C))
+        self.car_skip_norm = nn.ModuleList(car_skip_norm)
+        self.car_skip_linear = nn.ModuleList(car_skip_linear)
+        
+        print(f"Initialized CAR modules with {len(self.car_blocks)} control blocks")
+    
+    def has_car_modules(self):
+        """檢查是否已初始化 CAR 模塊"""
+        return hasattr(self, 'car_control_convs')
+    
+    def init_car_modules_if_needed(self):
+        """如果尚未初始化則初始化 CAR 模塊"""
+        if not self.has_car_modules():
+            self._init_car_modules()
+    
+    def load_car_weights(self, car_state_dict: dict, strict=False):
+        """載入 CAR 模塊的權重
+        Args:
+            car_state_dict: CAR 模塊的 state_dict
+            strict: 是否嚴格匹配參數名稱
+        """
+        if not self.has_car_modules():
+            print("CAR modules not initialized, initializing now...")
+            self._init_car_modules()
+        
+        # 篩選出 CAR 相關的參數
+        car_params = {}
+        current_state_dict = self.state_dict()
+        
+        loaded_count = 0
+        skipped_count = 0
+        
+        for name, param in car_state_dict.items():
+            if any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                if name in current_state_dict:
+                    current_param = current_state_dict[name]
+                    if current_param.shape == param.shape:
+                        car_params[name] = param
+                        loaded_count += 1
+                    else:
+                        print(f"Warning: Shape mismatch for CAR parameter {name}: expected {current_param.shape}, got {param.shape}")
+                        skipped_count += 1
+                        if strict:
+                            raise RuntimeError(f"Shape mismatch for {name}")
+                else:
+                    print(f"Warning: CAR parameter {name} not found in current model")
+                    skipped_count += 1
+                    if strict:
+                        raise RuntimeError(f"Parameter {name} not found")
+        
+        if car_params:
+            missing_keys, unexpected_keys = self.load_state_dict(car_params, strict=False)
+            print(f"Successfully loaded {loaded_count} CAR parameters")
+            if missing_keys:
+                print(f"Missing CAR keys: {len(missing_keys)}")
+            if unexpected_keys:
+                print(f"Unexpected CAR keys: {len(unexpected_keys)}")
+        else:
+            print("No matching CAR parameters found to load, using random initialization")
+        
+        if skipped_count > 0:
+            print(f"Skipped {skipped_count} CAR parameters due to mismatch")
+    
+    def save_car_weights(self):
+        """保存 CAR 模塊的權重
+        Returns:
+            dict: 包含所有 CAR 參數的字典
+        """
+        car_state = {}
+        for name, param in self.named_parameters():
+            if any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                car_state[name] = param.detach().cpu()
+        return car_state
+    
+    def save_infinity_weights(self):
+        """保存 Infinity 基礎模型的權重
+        Returns:
+            dict: 包含所有 Infinity 基礎參數的字典
+        """
+        infinity_state = {}
+        for name, param in self.named_parameters():
+            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                infinity_state[name] = param.detach().cpu()
+        return infinity_state
+    
+    def get_car_parameters(self):
+        """獲取所有 CAR 模塊的參數"""
+        car_params = []
+        for name, param in self.named_parameters():
+            if any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                car_params.append(param)
+        return car_params
+    
+    def get_infinity_parameters(self):
+        """獲取所有 Infinity 基礎模型的參數"""
+        infinity_params = []
+        for name, param in self.named_parameters():
+            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                infinity_params.append(param)
+        return infinity_params
+
+    def set_control_tensors(self, control_tensors: List[torch.Tensor]):
+        """
+        設置控制條件張量
+        Args:
+            control_tensors: 控制條件張量列表，每個張量對應一個尺度
+        """
+        self.control_tensors = control_tensors
+
+    def prepare_control_for_scales(self, control_image: torch.Tensor, scale_schedule: List[Tuple[int]]) -> List[torch.Tensor]:
+        """
+        為每個尺度準備控制條件
+        Args:
+            control_image: 原始控制圖像 [B, C, H, W]
+            scale_schedule: 尺度排程
+        Returns:
+            每個尺度對應的控制張量列表
+        """
+        control_tensors = []
+        for pt, ph, pw in scale_schedule:
+            # 將控制圖像調整到對應尺度
+            target_size = (ph * 16, pw * 16)  # 假設每個patch是16x16
+            control_resized = F.interpolate(control_image, size=target_size, mode='bilinear', align_corners=False)
+            # 正規化到 [-1, 1]
+            if control_resized.min() >= 0 and control_resized.max() <= 1:
+                control_resized = control_resized * 2 - 1
+            control_tensors.append(control_resized)
+        return control_tensors
 
     def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC_wo_prefix: torch.Tensor, scale_schedule: List[Tuple[int]],
-        cfg_infer=False,
-        **kwargs,
+        cfg_infer=False, control_tensors: Optional[List[torch.Tensor]] = None,  **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
-        """
-        label_B_or_BLT: label_B or (kv_compact, cu_seqlens_k, max_seqlen_k)
-        :return: logits BLV, V is vocab_size
-        """
+
         if cfg_infer:
-            return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
+            return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, control_tensors=control_tensors, **kwargs)
         
         x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
         B = x_BLC_wo_prefix.shape[0]
@@ -429,8 +663,59 @@ class Infinity(nn.Module):
         else:
             attn_fn = None
 
-        # [2. block loop]
-        SelfAttnBlock.forward, CrossAttnBlock.forward
+        # [1.2. 處理控制條件] - 參考 CAR 的處理方式
+        control_residual_f = []
+        if control_tensors is not None:
+            # 確保控制張量數量與尺度匹配
+            assert len(control_tensors) == len(scale_schedule), f"Expected {len(scale_schedule)} control tensors, got {len(control_tensors)}"
+            
+            # 處理第一個尺度的控制輸入（基於 sos）
+            ptr = 1  # 跳過 sos token
+            car_input_list = []
+            
+            for si, (pn, control_tensor) in enumerate(zip(scale_schedule, control_tensors)):
+                # 獲取這個尺度對應的 token
+                scale_seq_len = np.array(pn).prod()
+                if si == 0:
+                    # 第一個尺度使用 sos
+                    var_x = sos.transpose(1, 2).contiguous().reshape(B, self.C, 1, 1)  # 假設第一個尺度是 1x1
+                else:
+                    # 其他尺度使用對應的 tokens
+                    scale_tokens = x_BLC[:, ptr:ptr+scale_seq_len]
+                    ptr += scale_seq_len
+                    var_x = scale_tokens.transpose(1, 2).contiguous().reshape(B, self.C, pn[1], pn[2])
+                
+                # 通過 VAR 卷積
+                var_x = self.car_var_conv(var_x)
+                
+                # 處理控制條件
+                control_f = self.car_control_convs(control_tensor)
+                # 將控制特徵調整到正確尺寸
+                if control_f.shape[-2:] != var_x.shape[-2:]:
+                    control_f = F.interpolate(control_f, size=var_x.shape[-2:], mode='bilinear', align_corners=False)
+                
+                # 添加控制特徵
+                car_x = var_x + control_f
+                car_x = car_x.view(B, self.C, -1).transpose(1, 2).contiguous()
+                car_input_list.append(car_x)
+            
+            # 連接所有尺度的控制輸入
+            car_input = torch.cat(car_input_list, dim=1)
+            
+            # 添加 level 和 position embedding
+            if need_to_pad:
+                car_input = F.pad(car_input, (0, 0, 0, need_to_pad))
+            car_input = self.add_lvl_embeding_for_x_BLC(car_input, scale_schedule, need_to_pad)
+            
+            # 通過 CAR 控制塊
+            for cb in self.car_blocks:
+                if self.checkpointing == 'full-block' and self.training:
+                    car_input = torch.utils.checkpoint.checkpoint(cb, car_input, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
+                else:
+                    car_input = cb(x=car_input, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid)
+                control_residual_f.append(car_input)
+
+        # [2. block loop] - 修改以支援控制條件
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training
         if self.num_block_chunks == 1:
             for i, b in enumerate(self.blocks):
@@ -438,53 +723,41 @@ class Infinity(nn.Module):
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
+                
+                # 在後半部分塊中融合控制特徵
+                if control_tensors is not None and i >= len(self.blocks) - self.car_depth:
+                    skip_idx = i - (len(self.blocks) - self.car_depth)
+                    if skip_idx < len(control_residual_f):
+                        con_f = control_residual_f[skip_idx]
+                        cat = torch.cat([x_BLC, con_f], dim=-1)
+                        cat = self.car_skip_norm[skip_idx](cat)
+                        x_BLC = self.car_skip_linear[skip_idx](cat)
+                
                 if checkpointing_full_block:
                     x_BLC = torch.utils.checkpoint.checkpoint(b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
                 else:
                     x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid)
         else:
-            for i, chunk in enumerate(self.block_chunks): # this path
+            for i, chunk in enumerate(self.block_chunks):
                 if self.add_lvl_embeding_only_first_block and i == 0:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
+                
+                # 在後半部分塊中融合控制特徵
+                if control_tensors is not None and i >= self.num_block_chunks // 2:
+                    skip_idx = i - self.num_block_chunks // 2
+                    if skip_idx < len(control_residual_f):
+                        con_f = control_residual_f[skip_idx]
+                        cat = torch.cat([x_BLC, con_f], dim=-1)
+                        cat = self.car_skip_norm[skip_idx](cat)
+                        x_BLC = self.car_skip_linear[skip_idx](cat)
+                
                 x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
 
         # [3. unpad the seqlen dim, and then get logits]
         return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
 
-    @torch.no_grad()
-    # ----------------------------------------------------------------------------------
-    # modified
-    # ----------------------------------------------------------------------------------
-    def setup_mask_processor(self, vae, scale_schedule, bitwise_self_correction):
-        """設置 mask 處理器"""
-        from infinity.utils.mask_utils import MaskFeatureProcessor
-        self.mask_processor = MaskFeatureProcessor(
-            vae,
-            scale_schedule=scale_schedule,
-            device=torch.device('cuda:0'),
-            other_args=self,
-            bitwise_self_correction=bitwise_self_correction
-        )
-        self.mask_path = None
-        self.mask_scale_idx = None
-        self.mask_method = 'weighted'
-        self.mask_alpha = 0.3
-
-    def set_mask(self, mask_path, scale_idx=[0,1,2,3,4,5,6,7,8,9,10,11], method='weighted', alpha=0.3, strength=None):
-        """設置要應用的 mask 和相關參數"""
-        self.mask_path = mask_path
-        self.mask_scale_idx = scale_idx
-        self.mask_method = method
-        self.mask_alpha = alpha
-        self.mask_strength = strength if strength is not None else [1.0] * (len(scale_idx)+1)
-        if mask_path:
-            # self.mask_processor.set_mask(mask_path)
-            pass
-    # ----------------------------------------------------------------------------------
-    # modified
-    # ----------------------------------------------------------------------------------
     def autoregressive_infer_cfg(
         self,
         vae=None,
@@ -500,6 +773,7 @@ class Infinity(nn.Module):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
+        control_tensors: Optional[List[torch.Tensor]] = None,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -542,14 +816,33 @@ class Infinity(nn.Module):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
-
+        
+        # 預處理控制條件特徵
+        control_f = []
+        if control_tensors is not None:
+            assert len(control_tensors) == len(scale_schedule), f"Expected {len(scale_schedule)} control tensors, got {len(control_tensors)}"
+            for control_tensor in control_tensors:
+                # 確保控制張量的批次維度正確
+                if control_tensor.shape[0] != B:
+                    control_tensor = control_tensor.repeat(B, 1, 1, 1) if control_tensor.shape[0] == 1 else control_tensor[:B]
+                control_i = self.car_control_convs(control_tensor)
+                control_f.append(control_i)
+        
+        # define model blocks
         if inference_mode:
             for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
+            for b in self.car_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
                     (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+            for block_chunk_ in self.car_blocks:
+                if hasattr(block_chunk_, 'module'):
+                    for module in block_chunk_.module.module:
+                        (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+                else:
+                    (block_chunk_.sa if isinstance(block_chunk_, CrossAttnBlock) else block_chunk_.attn).kv_caching(True)
         
         abs_cfg_insertion_layers = []
         add_cfg_on_logits, add_cfg_on_probs = False, False
@@ -567,6 +860,10 @@ class Infinity(nn.Module):
         
         num_stages_minus_1 = len(scale_schedule)-1
         summed_codes = 0
+        
+        # 初始化控制分支的輸入
+        next_control_token_map = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
+        
         for si, pn in enumerate(scale_schedule):   # si: i-th segment
             cfg = cfg_list[si]
             if si >= trunk_scale:
@@ -576,24 +873,53 @@ class Infinity(nn.Module):
             need_to_pad = 0
             attn_fn = None
             if self.use_flex_attn:
-                # need_to_pad = (self.pad_to_multiplier - cur_L % self.pad_to_multiplier) % self.pad_to_multiplier
-                # if need_to_pad:
-                #     last_stage = F.pad(last_stage, (0, 0, 0, need_to_pad))
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
 
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            # 處理控制條件分支（參考 CAR 的做法）
+            control_residual_f = []
+            if control_tensors is not None:
+                # 準備控制分支的輸入
+                var_x = next_control_token_map.transpose(1, 2).contiguous().reshape(bs, self.C, pn[1], pn[2])
+                var_x = self.car_var_conv(var_x)
+                
+                # 添加控制特徵
+                control_x = control_f[si].repeat(bs//B, 1, 1, 1) if bs > B else control_f[si]
+                if control_x.shape[-2:] != var_x.shape[-2:]:
+                    control_x = F.interpolate(control_x, size=var_x.shape[-2:], mode='bilinear', align_corners=False)
+                
+                control_x = var_x + control_x
+                control_x = control_x.view(bs, self.C, -1).transpose(1, 2)
+                
+                # 添加位置嵌入
+                if self.add_lvl_embeding_only_first_block:
+                    control_x = self.add_lvl_embeding(control_x, si, scale_schedule, need_to_pad=need_to_pad)
+                
+                # 通過控制塊
+                for cb in self.car_blocks:
+                    control_x = cb(x=control_x, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                    control_residual_f.append(control_x)
+
+            # 主分支處理
             layer_idx = 0
             for block_idx, b in enumerate(self.block_chunks):
-                # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
                 if self.add_lvl_embeding_only_first_block and block_idx == 0:
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 if not self.add_lvl_embeding_only_first_block: 
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 
                 for m in b.module:
+                    # 在後半部分融合控制特徵
+                    if control_tensors is not None and layer_idx >= len(self.unregistered_blocks) // 2:
+                        skip_idx = layer_idx - len(self.unregistered_blocks) // 2
+                        if skip_idx < len(control_residual_f):
+                            con_f = control_residual_f[skip_idx]
+                            cat = torch.cat([last_stage, con_f], dim=-1)
+                            cat = self.car_skip_norm[skip_idx](cat)
+                            last_stage = self.car_skip_linear[skip_idx](cat)
+                    
                     last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                    
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
-                        # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
                         last_stage = torch.cat((last_stage, last_stage), 0)
                     layer_idx += 1
@@ -611,6 +937,7 @@ class Infinity(nn.Module):
                 idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1) # si=0: [1, 1, 32] si=1: [1, 4, 32]
             else:
                 idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+            
             if vae_type != 0:
                 assert returns_vemb
                 if si < gt_leak: # false
@@ -626,98 +953,9 @@ class Infinity(nn.Module):
 
                 idx_Bld_list.append(idx_Bld)
                 codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label') # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
-                # ----------------------------------------------------------------------------------
-                # modified
-                # ----------------------------------------------------------------------------------
-                # if si in getattr(self, 'mask_scale_idx', -1) and hasattr(self, 'mask_processor') and self.mask_path:
-                #     # 獲取當前特徵的空間尺寸
-                #     if codes.dim() == 5:
-                #         B, C, T, H, W = codes.shape
-                #         codes = codes.squeeze(2)
-                #     elif codes.dim() == 4:
-                #         B, C, H, W = codes.shape
-                #     else:
-                #         raise ValueError(f"Unexpected codes shape: {codes.shape}")
 
-                #     # 確保 mask 已經被設置
-                #     if not hasattr(self, 'mask'):
-                #         self.mask = self.mask_processor.set_mask(self.mask_path, si)
-                #     codes = self.mask
-                # ----------------------------------------------------------------------------------
-                # modified
-                # ----------------------------------------------------------------------------------
                 if si != num_stages_minus_1:
-                    #---------------------------------------------------------------------------------------------
-                    #text mask  
-                    #---------------------------------------------------------------------------------------------
-                    # strength = [0.9, 0.8, 0.75, 0.95, 1, 1, 1, 1, 0.7, 0.7, 0.9, 0.95] # text mask 1
-                    # strength = [0.8, 1, 0.95, 1, 0.6, 1, 1, 0.7, 0.9, 0.79, 0.89, 0.93] # text mask 2
-                    # strength = [0.2, 1, 1, 0.8, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 3
-                    # strength = [0.23, 0.95, 0.87, 1, 1, 0.99, 1, 1, 1, 1, 1, 1] # text mask 4
-                    # strength = [0.23, 0.6, 0.78, 0.99, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 5 very bad like input mask
-                    # strength = [0.23, 0.8, 0.9, 0.99, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 6
-                    # strength = [0.4, 0.75, 0.95, 1, 1, 1, 1, 1, 1, 1, 1, 1] # text mask 7
-                    # strength = [0.95, 0.7, 0.8, 0.95, 0.99, 1, 1, 0.999, 0.89, 0.79, 0.895, 0.93] # no word
-                    #---------------------------------------------------------------------------------------------
-                    #normal map  
-                    #---------------------------------------------------------------------------------------------
-                    # strength = [0.5, 0.95, 1, 0.95, 0.99, 1, 1, 0.65, 0.89, 0.79, 0.895, 0.93] # normal map too strong(new) try1
-                    # strength = [0.5, 0.65, 1, 0.95, 0.99, 1, 1, 0.9, 0.85, 0.9, 0.92, 0.95] # normal try4
-                    # strength = [0.5, 0.5, 1, 1, 1, 1, 1, 0.92, 0.95, 0.93, 0.92, 0.95] # normal try5
-                    # strength = [0.65, 0.75, 1, 1, 1, 1, 1, 0.9, 0.9, 0.9, 0.92, 0.95] # normal try6
-                    # strength = [0.55, 0.7, 1, 1, 1, 1, 1, 0.88, 1, 1, 1, 1] # normal try7
-                    # strength = [0.35, 0.85, 1, 1, 1, 0.8, 1, 1, 1, 1, 1, 1] # normal try8
-                    # strength = [0.45, 0.95, 1, 1, 1, 0.9, 0.95, 1, 1, 1, 1, 1] # normal try9
-                    # strength = [0.40, 0.83, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try10
-                    # strength = [0.40, 0.87, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try11
-                    # strength = [0.40, 0.9, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try12
-                    # strength = [0.37, 0.9, 1, 1, 1, 0.88, 0.95, 1, 1, 1, 1, 1] # normal try13
-                    # strength = [0.40, 0.87, 0.95, 1, 0.88, 1, 1, 1, 1, 1, 1, 1] # normal try14
-                    # strength = [0.40, 0.87, 0.95, 0.88, 1, 1, 1, 1, 1, 1, 1, 1] # normal try15
-                    # strength = [0.3, 0.92, 0.95, 0.98, 1, 1, 1, 1, 1, 1, 1, 1] # normal try16
-                    # strength = [0.35, 0.95, 0.96, 0.98, 1, 1, 1, 1, 1, 1, 1, 1] # normal try17
-                    # strength = [0.35, 0.92, 0.97, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try18
-                    # strength = [0.2, 0.97, 0.98, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try19
-                    # strength = [0.23, 0.95, 0.97, 1, 1, 0.99, 1, 1, 1, 1, 1, 1] # normal try20
-                    # strength = [0.23, 0.95, 1, 0.99, 1, 1, 1, 1, 1, 1, 1, 1] # normal try21
-                    # strength = [0.15, 0.97, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try22
-                    # strength = [0.187, 0.935, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # normal try23
-                    # strength = [0.5, 0.95, 0.97, 1, 1, 0.99, 1, 1, 1, 1, 1, 1] # normal try24
-                    # strength = [0.40, 0.87, 0.95, 1, 0.88, 1, 1, 1, 1, 1, 1, 1] # normal try14
-                    #---------------------------------------------------------------------------------------------
-                    # pure predict
-                    #---------------------------------------------------------------------------------------------
-                    # strength = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # original
-                    # strength = [0.35, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # gen hint
-                    # strength = [0.7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # gen hint2
-                    # strength = [0.35,0.97, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] # gen hint scene3d
-                    # strength = [0.35, 0.7, 0.9, 0.95, 0.98, 1, 1, 1, 1, 1, 1, 1] # gen hint3
-                    #---------------------------------------------------------------------------------------------
-                    # txt edit
-                    #---------------------------------------------------------------------------------------------
-                    # strength = [0.6, 1, 0.93, 0.9, 0.75, 0.75, 1, 1, 0.8, 0.97, 0.99, 1.0] # edit 1
-                    # strength = [0.62, 1, 0.95, 0.92, 0.72, 0.8, 1, 1, 0.85, 0.97, 0.99, 1.0] # edit 2
-                    # strength = [0.62, 1, 0.95, 0.92, 0.8, 0.82, 1, 1, 0.87, 0.97, 0.97, 1.0] # edit 3
-                    # strength = [0.7, 1, 0.95, 1, 0.79, 0.82, 1, 1, 0.9, 0.97, 0.99, 1.0] # edit 4
-                    # strength = [0.55, 0.92, 0.85, 1, 1, 0.93, 1, 0.93, 1, 1, 1, 1] # edit 5 (with fake text and prompt)
-                    # strength = [0.55, 0.72, 0.80, 1, 1, 0.87, 1, 0.93, 1, 1, 1, 1] # edit 6 (with fake text no prompt)
-                    # strength = [0.5, 0.7, 0.80, 0.9, 0.87, 1, 1, 0.93, 1, 1, 1, 1] # edit 7 (with fake text no prompt)
-                    # strength = [0.3, 0.5, 1, 1, 1, 1, 1, 1, 0.85, 0.9, 0.95, 1] # edit 8 (with fake text no prompt)
-                    # strength = [0.3, 0.5, 1, 1, 1, 1, 1, 1, 0.80, 0.88, 0.92, 0.95] # edit 9 (with fake text no prompt)
-                    # strength = [0.5, 0.75, 0.90, 0.85, 1, 1, 1, 1, 1, 1, 1, 1] # edit 10 (with fake text and prompt)
-                    # strength = [0.7, 0.8, 0.90, 0.9, 0.9, 1, 1, 1, 1, 1, 1, 1] # edit 11 (with fake text and prompt)
-                    # strength = [0.7, 1, 0.92, 1, 1, 1, 1, 1, 0.96, 0.93, 1, 1] # edit 12 (with fake text and prompt) supreme!!
-                    # strength = [0.7, 1, 0.92, 1, 1, 1, 1, 1, 0.96, 0.93, 1, 1] # edit 13 (with fake text and prompt)
-                    strength = self.mask_strength
-                    
-                    if si in getattr(self, 'mask_scale_idx', -1):
-                        self.mask, self.mask_zeroed = self.mask_processor.set_mask(self.mask_path, si)
-                        mask_codes = self.mask
-                        codes = F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)*strength[si] + mask_codes*(1-strength[si])
-                        # codes = F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
-                        summed_codes += codes
-                    else:
-                        summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
+                    summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
                     last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up) # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
                     last_stage = last_stage.squeeze(-3) # [B, d, h, w] or [B, d, 2h, 2w]
                     if self.apply_spatial_patchify: # patchify operation
@@ -725,18 +963,13 @@ class Infinity(nn.Module):
                     last_stage = last_stage.reshape(*last_stage.shape[:2], -1) # [B, d, h*w] or [B, 4d, h*w]
                     last_stage = torch.permute(last_stage, [0,2,1]) # [B, h*w, d] or [B, h*w, 4d]
                 else:
-                    self.mask,_ = self.mask_processor.set_mask(self.mask_path, 12)
-                    mask_codes = self.mask
-                    # summed_codes = mask_codes # reconstruction
+                    
                     summed_codes += codes
-                    # summed_codes = mask_codes*0.1 + summed_codes*0.9
-                    print("mask set")
             else:
                 if si < gt_leak:
                     idx_Bl = gt_ls_Bl[si]
                 h_BChw = self.quant_only_used_in_inference[0].embedding(idx_Bl).float()   # BlC
 
-                # h_BChw = h_BChw.float().transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1])
                 h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1], scale_schedule[si][2])
                 ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
                 idx_Bl_list.append(idx_Bl)
@@ -746,14 +979,23 @@ class Infinity(nn.Module):
             if si != num_stages_minus_1:
                 last_stage = self.word_embed(self.norm0_ve(last_stage))
                 last_stage = last_stage.repeat(bs//B, 1, 1)
+                # 同時更新控制分支的輸入
+                next_control_token_map = last_stage
 
         if inference_mode:
             for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
+            for b in self.car_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
                     (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+            for block_chunk_ in self.car_blocks:
+                if hasattr(block_chunk_, 'module'):
+                    for module in block_chunk_.module.module:
+                        (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+                else:
+                    (block_chunk_.sa if isinstance(block_chunk_, CrossAttnBlock) else block_chunk_.attn).kv_caching(False)
 
         if not ret_img:
             return ret, idx_Bl_list, []
@@ -766,154 +1008,7 @@ class Infinity(nn.Module):
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
         return ret, idx_Bl_list, img
-    
-    @for_visualize
-    def vis_key_params(self, ep):
-        return
-    
-    def load_state_dict(self, state_dict: Dict[str, Any], strict=False, assign=False):
-        for k in state_dict:
-            if 'cfg_uncond' in k:
-                old, new = state_dict[k], self.cfg_uncond.data
-                min_tlen = min(old.shape[0], new.shape[0])
-                if min_tlen == old.shape[0]:
-                    state_dict[k] = torch.cat((old.to(device=new.device, dtype=new.dtype), new[min_tlen:]))
-                else:
-                    state_dict[k] = old[:min_tlen]
-        
-        for buf_name in ('lvl_1L', 'attn_bias_for_masking', 'Infinity_visible_kvlen', 'Infinity_invisible_qlen'):
-            state_dict.pop(buf_name, None)
-            if hasattr(self, buf_name):
-                state_dict[buf_name] = getattr(self, buf_name)
-        
-        return super().load_state_dict(state_dict=state_dict, strict=strict, assign=assign)
-    
-    def special_init(
-        self,
-        aln_init: float,
-        aln_gamma_init: float,
-        scale_head: float,
-        scale_proj: int,
-    ):
-        # init head's norm
-        if isinstance(self.head_nm, AdaLNBeforeHead):
-            self.head_nm.ada_lin[-1].weight.data.mul_(aln_init)    # there's no gamma for head
-            if hasattr(self.head_nm.ada_lin[-1], 'bias') and self.head_nm.ada_lin[-1].bias is not None:
-                self.head_nm.ada_lin[-1].bias.data.zero_()
-        
-        # init head's proj
-        if scale_head >= 0:
-            if isinstance(self.head, nn.Linear):
-                self.head.weight.data.mul_(scale_head)
-                self.head.bias.data.zero_()
-            elif isinstance(self.head, nn.Sequential):
-                self.head[-1].weight.data.mul_(scale_head)
-                self.head[-1].bias.data.zero_()
-        
-        depth = len(self.unregistered_blocks)
-        for block_idx, sab in enumerate(self.unregistered_blocks):
-            sab: Union[SelfAttnBlock, CrossAttnBlock]
-            # init proj
-            scale = 1 / math.sqrt(2*depth if scale_proj == 1 else 2*(1 + block_idx))
-            if scale_proj == 1:
-                if self.t2i:
-                    sab.sa.proj.weight.data.mul_(scale)
-                    sab.ca.proj.weight.data.mul_(scale)
-                else:
-                    sab.attn.proj.weight.data.mul_(scale)
-                sab.ffn.fc2.weight.data.mul_(scale)
-            # if sab.using_swiglu:
-            #     nn.init.ones_(sab.ffn.fcg.bias)
-            #     nn.init.trunc_normal_(sab.ffn.fcg.weight, std=1e-5)
-            
-            # init ada_lin
-            if hasattr(sab, 'ada_lin'):
-                lin = sab.ada_lin[-1]
-                lin.weight.data[:2*self.C].mul_(aln_gamma_init)     # init gamma
-                lin.weight.data[2*self.C:].mul_(aln_init)           # init scale and shift
-                if hasattr(lin, 'bias') and lin.bias is not None:
-                    lin.bias.data.zero_()
-            elif hasattr(sab, 'ada_gss'):
-                sab.ada_gss.data[:, :, :2, :].mul_(aln_gamma_init)  # init gamma
-                sab.ada_gss.data[:, :, 2:, :].mul_(aln_init)        # init scale and shift
-    
-    def extra_repr(self):
-        return f'drop_path_rate={self.drop_path_rate}'
-    
-    def get_layer_id_and_scale_exp(self, para_name: str):
-        raise NotImplementedError
 
-class InfinityPilot(Infinity):
-    """
-    ## 🧑‍🚀InfinityPilot: surf beyond the infinity!🛰️
-    This is a variant of Infinity that can refer to the condition image and prompt text to generate images that imply to the conditions.
-    
-    Like the ControlNet for diffusion models, it can be used to control the generation process.
-
-    Args:
-        vae_local: VAE model or module used for image encoding/decoding.
-        text_channels (int, default=0): Number of text channels for text-conditioned generation.
-        text_maxlen (int, default=0): Maximum length of text input.
-        selecting_idx (Optional[int], default=None): Index for class-conditioned generation.
-        embed_dim (int, default=1024): Embedding dimension of the model.
-        depth (int, default=16): Number of transformer blocks (model depth).
-        num_heads (int, default=16): Number of attention heads.
-        mlp_ratio (float, default=4.0): Ratio of MLP hidden dimension to embedding dimension.
-        drop_rate (float, default=0.0): Dropout rate for regularization.
-        drop_path_rate (float, default=0.0): Drop path rate for stochastic depth.
-        norm_eps (float, default=1e-6): Epsilon value for normalization layers.
-        rms_norm (bool, default=False): If True, use RMSNorm instead of LayerNorm.
-        shared_aln (bool, default=False): If True, use shared adaptive layer normalization.
-        head_aln (bool, default=True): If True, use adaptive normalization in attention heads.
-        cond_drop_rate (float, default=0.1): Drop rate for classifier-free guidance.
-        rand_uncond (bool, default=False): If True, randomly use unconditional generation.
-        cross_attn_layer_scale (float, default=-1.0): Scaling factor for cross-attention layers.
-        nm0 (bool, default=False): Custom normalization flag.
-        tau (float, default=1): Temperature parameter for attention or sampling.
-        cos_attn (bool, default=True): If True, use cosine attention mechanism.
-        swiglu (bool, default=False): If True, use SwiGLU activation in MLPs.
-        raw_scale_schedule (tuple, default=(1,2,3,4,5,6,8,10,13,16)): Schedule for raw scaling across layers.
-        head_depth (int, default=1): Depth of the attention head module.
-        top_p (float, default=0.0): Nucleus sampling parameter (top-p).
-        top_k (float, default=0.0): Top-k sampling parameter.
-        customized_flash_attn (bool, default=False): If True, use customized FlashAttention.
-        fused_mlp (bool, default=False): If True, use fused MLP implementation.
-        fused_norm (bool, default=False): If True, use fused normalization implementation.
-        block_chunks (int, default=1): Number of chunks to split blocks for memory efficiency.
-        checkpointing (Optional[Any], default=None): Checkpointing strategy for memory saving.
-        pad_to_multiplier (int, default=0): Pad input to a multiple of this value.
-        use_flex_attn (bool, default=False): If True, use flexible attention mechanism.
-        batch_size (int, default=2): Batch size for training or inference.
-        add_lvl_embeding_only_first_block (int, default=1): If True, add level embedding only in the first block.
-        use_bit_label (int, default=1): If True, use bit-level labels.
-        rope2d_each_sa_layer (int, default=0): If True, apply 2D RoPE to each self-attention layer.
-        rope2d_normalized_by_hw (int, default=0): If True, normalize 2D RoPE by height/width.
-        pn (Optional[Any], default=None): Additional parameter, purpose defined by implementation.
-        train_h_div_w_list (Optional[list], default=None): List of height/width ratios for training.
-        video_frames (int, default=1): Number of video frames for video input.
-        always_training_scales (int, default=20): Number of scales always used during training.
-        apply_spatial_patchify (int, default=0): If True, apply spatial patchification.
-        inference_mode (bool, default=False): If True, set model to inference mode.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.beyond_infinity = True
-
-        self.pilot_blocks = nn.ModuleList([
-            AdaLNSelfAttn(
-                cond_dim=self.D, shared_aln=shared_aln,
-                block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx],
-                last_drop_p=0 if block_idx == 0 else dpr[block_idx - 1],
-                attn_l2_norm=attn_l2_norm,
-                flash_if_available=flash_if_available, fused_if_available=fused_if_available,
-            )
-            for block_idx in range(depth // 2)
-        ])
-    def beyond():
-        """
-            refer to CAR
-        """
 
 
 def sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV: torch.Tensor, top_k: int = 0, top_p: float = 0.0, rng=None, num_samples=1) -> torch.Tensor:  # return idx, shaped (B, l)
@@ -965,6 +1060,36 @@ def get_params_num(d, w, mlp):
 
 TIMM_KEYS = {'img_size', 'pretrained', 'pretrained_cfg', 'pretrained_cfg_overlay', 'global_pool'}
 
+# InfinityPilot model registrations
+@register_model
+def infinity_pilot_2b(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+
+@register_model
+def infinity_pilot_20b(depth=58, embed_dim=4608, num_heads=4608//128, drop_path_rate=0.25, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+
+# model configuration for scaling InfinityPilot transformer
+@register_model
+def infinity_pilot_layer12(depth=12, embed_dim=768, num_heads=8, drop_path_rate=0.1, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+@register_model
+def infinity_pilot_layer16(depth=16, embed_dim=1152, num_heads=12, drop_path_rate=0.1, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+@register_model
+def infinity_pilot_layer24(depth=24, embed_dim=1536, num_heads=16, drop_path_rate=0.1, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+@register_model
+def infinity_pilot_layer32(depth=32, embed_dim=2080, num_heads=20, drop_path_rate=0.1, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+@register_model
+def infinity_pilot_layer40(depth=40, embed_dim=2688, num_heads=24, drop_path_rate=0.1, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+@register_model
+def infinity_pilot_layer48(depth=48, embed_dim=3360, num_heads=28, drop_path_rate=0.1, **kwargs): 
+    return InfinityPilot(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+
+# Original Infinity model registrations (kept for backward compatibility)
 @register_model
 def infinity_2b(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, **kwargs): return Infinity(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
 

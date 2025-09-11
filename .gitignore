@@ -15,6 +15,7 @@ fid/
 fid2/
 generated_control4/
 generated_control5/
+generated_totaltext/
 k/
 local_output/
 output/
@@ -26,3 +27,16 @@ vs_text_any/
 vs_text_sd3/
 vs_text_sdkl/
 vs_text_td2/
+
+.copilot_testing_code/
+debug/
+CAR/
+notes/
+
+
+# Python bytecode
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+

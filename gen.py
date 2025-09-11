@@ -147,7 +147,7 @@ if not hasattr(args, 'debug_bsc'):
     args.debug_bsc = False
 bitwise_self_correction = BitwiseSelfCorrection(vae, args)
 infinity.setup_mask_processor(vae, scale_schedule, bitwise_self_correction)
-mask_path = 'walmart.jpg'
+mask_path = '/home/avlab/SceneTxtVAR/control/lawson.jpg'
 infinity.set_mask(
     mask_path=mask_path,
     scale_idx=[0,1,2,3,4,5,6,7,8,9,10,11],

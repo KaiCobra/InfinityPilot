@@ -24,10 +24,13 @@ class Args(Tap):
     ds: str = 'oi'                      # only used in GPT training::load_viz_data & FID benchmark
     model: str = ''                     # for VAE training, 'b' or any other for GPT training
     short_cap_prob: float = 0.2         # prob for training with short captions
-    project_name: str = 'TextVAR'      # name of wandb project
+    project_name: str = 'TextVAR'       # name of wandb project
     tf32: bool = True                   # whether to use TensorFloat32
     auto_resume: bool = True            # whether to automatically resume from the last checkpoint found in args.bed
     rush_resume: str = ''               # pretrained infinity checkpoint
+    car_resume_path: str = ''           # pretrained CAR checkpoint (for InfinityPilot)
+    save_car_epoch_freq: int = 1        # 每多少個 epoch 保存一次 CAR 權重
+    save_car_separately: bool = True    # 是否分別保存 CAR 權重
     nowd: int = 1                       # whether to disable weight decay on sparse params (like class token)
     enable_hybrid_shard: bool = False   # whether to use hybrid FSDP
     inner_shard_degree: int = 1         # inner degree for FSDP
@@ -66,6 +69,7 @@ class Args(Tap):
     cos: bool = True                    # cosine attn as in swin v2
     swi: bool = False                   # whether to use FFNSwiGLU, instead of vanilla FFN
     dp: float = -1
+    dpr: float = 0.0                    # drop path rate for stochastic depth
     drop: float = 0.0                   # GPT's dropout (VAE's is --vd)
     hd: int = 0
     ca_gamma: float = -1                # >=0 for using layer-scale for cross attention
@@ -235,11 +239,27 @@ class Args(Tap):
     @property
     def is_gpt_visualization_only(self) -> bool:
         return self.g_seed > 0
-    g_seed: int = 0     # g_seed != 0 means the visualization-only mode
+    g_seed: int = 0                 # g_seed != 0 means the visualization-only mode
+
     # ==================================================================================================================
     # ======================== ignore these parts above since they are only for debug use ==============================
     # ==================================================================================================================
-    
+
+    # ==================================================================================================================
+        # ======================== these parts are only for [Infinity_Pilot] usage by Kai ==============================
+    debug:bool = False              # Selection of Debug mode: [True, False]
+    sync_tensorboard:bool = False   # sync to tensorboard (model structure) [True, False]
+    # Ablasion studies
+    car_depth = 4
+
+
+
+    # ==================================================================================================================
+
+
+
+
+
     @property
     def gpt_training(self):
         return len(self.model) > 0

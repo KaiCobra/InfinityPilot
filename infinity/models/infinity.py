@@ -54,7 +54,6 @@ class SharedAdaLin(nn.Linear):
         C = self.weight.shape[0] // 6
         return super().forward(cond_BD).reshape(-1, 1, 6, C)   # B16C
 
-
 class MultipleLayers(nn.Module):
     def __init__(self, ls, num_blocks_in_a_chunk, index):
         super().__init__()
@@ -76,7 +75,7 @@ class Infinity(nn.Module):
         self, vae_local,
         text_channels=0, text_maxlen=0,     # text-cond generation
         selecting_idx=None,                 # class-cond generation
-        embed_dim=1024, depth=16, num_heads=16, mlp_ratio=4.,   # model's architecture
+        embed_dim=2048, depth=16, num_heads=16, mlp_ratio=4.,   # model's architecture
         drop_rate=0., drop_path_rate=0.,    # drop out and drop path
         norm_eps=1e-6, rms_norm=False,      # norm layer
         shared_aln=False, head_aln=True,    # adaptive norm
@@ -86,7 +85,7 @@ class Infinity(nn.Module):
         raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         head_depth=1,
         top_p=0.0, top_k=0.0,
-        customized_flash_attn=False, fused_mlp=False, fused_norm=False, #modified
+        customized_flash_attn=False, fused_mlp=False, fused_norm=False, # modified
         block_chunks=1,
         checkpointing=None,
         pad_to_multiplier=0,

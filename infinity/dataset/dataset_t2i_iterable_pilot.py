@@ -260,22 +260,23 @@ class T2IIterableDataset(IterableDataset):
                     if ret:
                         c_, h_, w_ = model_input[1].shape[-3:]
                         # if c_ != 3 or np.abs(h_/w_-float(h_div_w_template)) > 0.02:
-                        #     if c_ != 3:
-                        #         print(f'C_ channels error')
-                        #     if np.abs(h_/w_-float(h_div_w_template)) > 0.02:
-                        #         print(f'h/w error: {np.abs(h_/w_- float(h_div_w_template))}')
-                            # print(f'Croupt data item: {data_item}')
-                        # else:
-                            # batch_data.append(model_input)
-                        batch_data.append(model_input)
+                        if c_ != 3:
+                            if c_ != 3:
+                                print(f'C_ channels error')
+                            # if np.abs(h_/w_-float(h_div_w_template)) > 0.02:
+                            #     print(f'h/w error: {np.abs(h_/w_- float(h_div_w_template))}')
+                        else:
+                            batch_data.append(model_input)
                     del data_item
                 except Exception as e:
                     print(e)
             captions = [item[0] for item in batch_data]
             images = torch.stack([item[1] for item in batch_data])
-            yield (images, captions)
+            condition_images = torch.stack([item[2] for item in batch_data]) # modified
+            yield (images, condition_images, captions) # modified
             del batch_data
             del images
+            del condition_images
             del captions
     
     def infinite_next(self, generator_info):
@@ -327,7 +328,10 @@ class T2IIterableDataset(IterableDataset):
             return long_text_input
 
     def prepare_model_input(self, data_item) -> Tuple:
-        img_path, h_div_w, normal_path = data_item['image_path'], data_item['h_div_w'], data_item['normal_path']
+        img_path, h_div_w = data_item['image_path'], data_item['h_div_w'] # for extra input "image pth 2"
+        # condition_path = data_item.get('normals', img_path) # for extra input "condition image pth 2"
+        condition_path = img_path.replace('images', 'normal_vis') # condition input
+        condition_path = condition_path.replace('jpg', 'png') # condition input 
         short_text_input, long_text_input = data_item['text'], data_item['long_caption']
         long_text_type = data_item.get('long_caption_type', 'user_prompt')
         text_input = self.get_text_input(long_text_input, short_text_input, long_text_type)
@@ -340,21 +344,19 @@ class T2IIterableDataset(IterableDataset):
                 vae_path = self.get_vae_path(img_path)
                 with open(vae_path, 'rb') as f:
                     gt_ms_idx_Bl = pickle.load(f)
-                
             else:
                 gt_ms_idx_Bl = None
                 with open(img_path, 'rb') as f:
                     img: PImage.Image = PImage.open(f)
                     img = img.convert('RGB')
-                    # tgt_h, tgt_w = dynamic_resolution_h_w[h_div_w_template][self.pn]['pixel']
                     tgt_h, tgt_w = dynamic_resolution_h_w[np.float64(1.0)][self.pn]['pixel']
                     img_B3HW = transform(img, tgt_h, tgt_w)
-                if self.condition:
-                    with open(normal_path, 'rb') as f:
-                        img_condition: PImage.Image = PImage.open(f)
-                        img_condition = img_condition.convert('RGB')
-                        tgt_h, tgt_w = dynamic_resolution_h_w[np.float64(1.0)][self.pn]['pixel']
-                        img_condition_B3HW = transform(img_condition, tgt_h, tgt_w)
+                # 處理條件圖像 modified
+                with open(condition_path, 'rb') as f:
+                    condition_img: PImage.Image = PImage.open(f)
+                    condition_img = condition_img.convert('RGB')
+                    # 使用相同的尺寸
+                    condition_B3HW = transform(condition_img, tgt_h, tgt_w)
             if not self.online_t5:
                 short_t5_path, long_t5_path = self.get_t5_path(img_path)
                 if self.epoch_global_worker_generator.random() <= self.short_prob:
@@ -363,19 +365,14 @@ class T2IIterableDataset(IterableDataset):
                     t5_path = long_t5_path
                 t5_meta = np.load(t5_path)
                 text_input = t5_meta['t5_feat'][:self.max_caption_len] # L x C
-            
-
-
         except Exception as e:
             print(f'input error: {e}, skip to another index')
             return False, None
 
-        if self.load_vae_instead_of_image is not False:
+        if self.load_vae_instead_of_image:
             return True, (text_input, *gt_ms_idx_Bl)
-        elif self.condition:
-            return True, (text_input, img_B3HW, img_condition_B3HW)
         else:
-            return True, (text_input, img_B3HW)
+            return True, (text_input, img_B3HW, condition_B3HW)
 
     @staticmethod
     def collate_function(batch, online_t5: bool = False) -> None:
@@ -421,6 +418,7 @@ if __name__ == '__main__':
                 total_samples = np.sum(list(h_div_w2samples.values()))
                 print()
                 for h_div_w, num in sorted(h_div_w2samples.items()):
-                    print(f'h_div_w: {h_div_w}, samples: {num}, proportion: {num/total_samples*100:.1f}%')
+                    # print(f'h_div_w: {h_div_w}, samples: {num}, proportion: {num/total_samples*100:.1f}%')
+                    pass
                 print()
             t1 = time.time()

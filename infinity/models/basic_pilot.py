@@ -1,5 +1,5 @@
 """
-Definitions of blocks of VAR transformer model. (basic.py)
+Definitions of blocks of VAR transformer model. (basic_pilot.py)
 """
 
 import math
@@ -19,6 +19,7 @@ from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret:
 from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
 
 from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
+from infinity.utils.pilot_utils import pil_to_numpy, numpy_to_pt
 
 # Import flash_attn's fused ops
 try:
@@ -34,6 +35,16 @@ except ImportError:
     def rms_norm_impl(x, weight, epsilon):
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add_(epsilon))) * weight
 
+def get_control_for_each_scale(control_image, scale):
+        def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
+            return x.add(x).add_(-1)
+        c_tensors = []
+        c_images = []
+        for pn in scale:
+            c_res = control_image.resize((pn * 16, pn * 16))
+            c_images.append(c_res)
+            c_tensors.append(normalize_01_into_pm1(numpy_to_pt(pil_to_numpy(c_res))))
+        return c_images, c_tensors
 
 def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_by_hw, pad_to_multiplier=1, max_height=2048 // 16, max_width=2048 // 16, base=10000.0, device=None, scaling_factor=1.0):
     # split the dimension into half, one for x and one for y
@@ -94,46 +105,26 @@ def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_
 
 
 def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier, rope2d_normalized_by_hw, scale_ind):
-    # Memory optimized version - avoid creating large intermediate tensors
-    device_type = q.device.type
+    qk = torch.stack((q, k), dim=0)  #(2, batch_size, heads, seq_len, head_dim)
+    device_type = qk.device.type
     device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
     with torch.autocast(device_type=device_type, enabled=False):
-        seq_len = q.shape[2]  # For flash format: (B, L, H, c)
+        seq_len = qk.shape[3]
         start = 0
         if scale_ind >= 1:
             assert len(scale_schedule[0]) == 3
             start = np.sum([item[0] * item[1] * item[2] for item in scale_schedule[:scale_ind]])
-        
-        # Get rope cache (ensure it's on the right device)
-        rope_key = str(tuple(scale_schedule))
-        if rope_key not in rope2d_freqs_grid:
-            return q, k  # No rope embedding available
-            
-        rope_cache = rope2d_freqs_grid[rope_key]
-        if rope_cache.device != q.device:
-            rope_cache = rope_cache.to(q.device)
-            rope2d_freqs_grid[rope_key] = rope_cache  # Update cache
-        
-        assert start+seq_len <= rope_cache.shape[4]
-        rope_slice = rope_cache[:, :, :, :, start:start+seq_len] # [2, 1, 1, 1, seq_len, half_head_dim]
-        
-        # Process q and k separately to save memory
-        def apply_rope_to_tensor(tensor):
-            # Reshape to separate real/imaginary parts
-            tensor_reshaped = tensor.reshape(*tensor.shape[:-1], -1, 2) # (..., half_head_dim, 2)
-            
-            # Apply rotation without creating intermediate stacked tensor
-            cos_part = rope_slice[0] * tensor_reshaped[..., 0] - rope_slice[1] * tensor_reshaped[..., 1]
-            sin_part = rope_slice[1] * tensor_reshaped[..., 0] + rope_slice[0] * tensor_reshaped[..., 1]
-            
-            # Recombine
-            result = torch.stack([cos_part, sin_part], dim=-1)
-            return result.reshape(*tensor.shape)
-        
-        q_rotated = apply_rope_to_tensor(q)
-        k_rotated = apply_rope_to_tensor(k)
-    
-    return q_rotated, k_rotated
+        rope2d_freqs_grid[str(tuple(scale_schedule))] = rope2d_freqs_grid[str(tuple(scale_schedule))].to(qk.device)
+        assert start+seq_len <= rope2d_freqs_grid[str(tuple(scale_schedule))].shape[4]
+        rope_cache = rope2d_freqs_grid[str(tuple(scale_schedule))][:, :, :, :, start:start+seq_len] # rope_cache shape: [2, 1, 1, 1, seq_len, half_head_dim]
+        qk = qk.reshape(*qk.shape[:-1], -1, 2) #(2, batch_size, heads, seq_len, half_head_dim, 2)
+        qk = torch.stack([
+            rope_cache[0] * qk[...,0] - rope_cache[1] * qk[...,1],
+            rope_cache[1] * qk[...,0] + rope_cache[0] * qk[...,1],
+        ], dim=-1) # (2, batch_size, heads, seq_len, half_head_dim, 2), here stack + reshape should not be concate
+        qk = qk.reshape(*qk.shape[:-2], -1) #(2, batch_size, heads, seq_len, head_dim)
+        q, k = qk.unbind(dim=0) # (batch_size, heads, seq_len, head_dim)
+    return q, k
 
 
 class FastRMSNorm(nn.Module):
@@ -216,7 +207,7 @@ class SelfAttention(nn.Module):
     def __init__(
         self, embed_dim=768, num_heads=12,
         proj_drop=0., tau=1, cos_attn=False, customized_flash_attn=True, use_flex_attn=False, 
-        batch_size=2, pad_to_multiplier=1, rope2d_normalized_by_hw=0,
+        batch_size=2, pad_to_multiplier=1, rope2d_normalized_by_hw=0, task_id=0,
     ):
         """
         :param embed_dim: model's width
@@ -229,7 +220,7 @@ class SelfAttention(nn.Module):
         super().__init__()
         assert embed_dim % num_heads == 0
         self.using_flash = customized_flash_attn
-        
+        self.task_id = task_id
         self.num_heads, self.head_dim = num_heads, embed_dim // num_heads
         self.tau, self.cos_attn = tau, cos_attn
         if self.cos_attn:
@@ -241,8 +232,20 @@ class SelfAttention(nn.Module):
         else:
             self.scale = 1 / math.sqrt(self.head_dim) / self.tau
         
-        self.mat_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
+        # self.mat_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.mat_qkv_tasks = nn.ModuleList([
+            nn.Linear(embed_dim, embed_dim * 3, bias=False), #Task1
+            nn.Linear(embed_dim, embed_dim * 3, bias=False), #Task2
+        ])
+        # self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
+        self.q_bias_tasks = nn.ParameterList([
+            nn.Parameter(torch.zeros(embed_dim)),
+            nn.Parameter(torch.zeros(embed_dim)),
+        ])
+        self.v_bias_tasks = nn.ParameterList([
+            nn.Parameter(torch.zeros(embed_dim)),
+            nn.Parameter(torch.zeros(embed_dim)),
+        ])
         self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
         
         self.proj = nn.Linear(embed_dim, embed_dim)
@@ -294,7 +297,7 @@ class SelfAttention(nn.Module):
         B, L, C = x.shape
         
         # qkv: amp, bf16
-        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
+        qkv = F.linear(input=x, weight=self.mat_qkv_tasks[self.task_id].weight, bias=torch.cat((self.q_bias_tasks[self.task_id], self.zero_k_bias, self.v_bias_tasks[self.task_id]))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
         if self.using_flash: q, k, v = qkv.unbind(dim=2); L_dim = 1           # q or k or v: all are shaped in (B:batch_size, L:seq_len, H:heads, c:head_dim)
         else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); L_dim = 2   # q or k or v: all are shaped in (B:batch_size, H:heads, L:seq_len, c:head_dim)
         
@@ -390,17 +393,11 @@ class CrossAttention(nn.Module):
         kv_compact, cu_seqlens_k, max_seqlen_k = ca_kv
         N = kv_compact.shape[0]
         
-        # Memory optimized: process kv_compact in-place to avoid extra memory allocation
-        with torch.no_grad():
-            # Pre-allocate bias tensor to avoid repeated cat operations
-            if not hasattr(self, '_cached_bias') or self._cached_bias.device != kv_compact.device:
-                self._cached_bias = torch.cat((self.zero_k_bias, self.v_bias)).to(kv_compact.device)
-        
-        kv_compact = F.linear(kv_compact, weight=self.mat_kv.weight, bias=self._cached_bias).view(N, 2, self.num_heads, self.head_dim) # NC => N2Hc
+        kv_compact = F.linear(kv_compact, weight=self.mat_kv.weight, bias=torch.cat((self.zero_k_bias, self.v_bias))).view(N, 2, self.num_heads, self.head_dim) # NC => N2Hc
+        # attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens
         
         if not self.for_attn_pool:
             B, Lq = q.shape[:2]
-            # Memory optimized: use smaller intermediate tensor
             q_compact = self.mat_q(q).view(-1, self.num_heads, self.head_dim)
         else:
             B = cu_seqlens_k.shape[0] - 1
@@ -414,37 +411,15 @@ class CrossAttention(nn.Module):
             k = F.normalize(k, dim=-1)
             kv_compact = torch.stack((k, v), dim=1)
         
-        # Ensure contiguous memory layout
         q_compact = q_compact.contiguous()
         kv_compact = kv_compact.contiguous()
         
-        # Pre-compute cu_seqlens_q to avoid repeated computation
         cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
-        
-        # Use mixed precision to save memory
-        if q_compact.dtype == torch.float32:
-            oup = flash_attn_varlen_kvpacked_func(
-                q=q_compact.to(dtype=torch.bfloat16), 
-                kv=kv_compact.to(dtype=torch.bfloat16), 
-                cu_seqlens_q=cu_seqlens_q, 
-                cu_seqlens_k=cu_seqlens_k, 
-                max_seqlen_q=Lq, 
-                max_seqlen_k=max_seqlen_k, 
-                dropout_p=0, 
-                softmax_scale=self.scale
-            ).reshape(B, Lq, -1)
+        if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
+            oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), kv=kv_compact.to(dtype=torch.bfloat16), cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
             oup = oup.float()
         else:
-            oup = flash_attn_varlen_kvpacked_func(
-                q=q_compact, 
-                kv=kv_compact, 
-                cu_seqlens_q=cu_seqlens_q, 
-                cu_seqlens_k=cu_seqlens_k, 
-                max_seqlen_q=Lq, 
-                max_seqlen_k=max_seqlen_k, 
-                dropout_p=0, 
-                softmax_scale=self.scale
-            ).reshape(B, Lq, -1)
+            oup = flash_attn_varlen_kvpacked_func(q=q_compact, kv=kv_compact, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
         
         return self.proj_drop(self.proj(oup))
     
@@ -457,16 +432,25 @@ class SelfAttnBlock(nn.Module):
         self, embed_dim, kv_dim, cross_attn_layer_scale, cond_dim, act: bool, shared_aln: bool, norm_layer: partial,
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
+        task_id=0,
     ):
         super(SelfAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
         self.drop_path_rate = drop_path
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.attn = SelfAttention(
-            embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn
+            embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn, attn_fn = attn_fn
         )
         self.using_swiglu = swiglu
-        self.ffn = (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio / 256) * 256, drop=drop, fused_mlp=fused_mlp)
+        self.task_id = task_id
+        # 為兩個 task 各自建立 FFN
+        ffn_cls = FFN if not swiglu else FFNSwiGLU
+        hidden = round(embed_dim * mlp_ratio / 256) * 256
+        self.ffns = nn.ModuleList([
+            ffn_cls(in_features=embed_dim, hidden_features=hidden, out_features=embed_dim, drop=drop, fused_mlp=fused_mlp),
+            ffn_cls(in_features=embed_dim, hidden_features=hidden, out_features=embed_dim, drop=drop, fused_mlp=fused_mlp),
+        ])
+        # self.ffn = (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio / 256) * 256, drop=drop, fused_mlp=fused_mlp)
         
         self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
         self.fused_norm_func = fused_norm_func
@@ -488,11 +472,11 @@ class SelfAttnBlock(nn.Module):
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
         
         if self.fused_ada_norm is None:
-            x = x + self.drop_path(self.attn( self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1), attn_bias_or_two_vector=attn_bias_or_two_vector ).mul_(gamma1))
-            x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+            x = x + self.drop_path(self.attn( self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1), attn_bias_or_two_vector=attn_bias_or_two_vector).mul_(gamma1))
+            x = x + self.drop_path(self.ffns[self.task_id]( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         else:
             x = x + self.drop_path(self.attn(self.fused_ada_norm(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1), attn_bias_or_two_vector=attn_bias_or_two_vector).mul_(gamma1))
-            x = x + self.drop_path(self.ffn(self.fused_ada_norm(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+            x = x + self.drop_path(self.ffns[self.task_id](self.fused_ada_norm(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         return x
     
     def extra_repr(self) -> str:
@@ -506,6 +490,7 @@ class CrossAttnBlock(nn.Module):
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
         use_flex_attn=False, batch_size=2, pad_to_multiplier=1, apply_rope2d=False, rope2d_normalized_by_hw=False,
+        task_id=0,
     ):
         super(CrossAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
@@ -514,10 +499,17 @@ class CrossAttnBlock(nn.Module):
         self.sa = SelfAttention(
             embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn,
             use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+            task_id=task_id,
         )
         self.ca = CrossAttention(embed_dim=embed_dim, kv_dim=kv_dim, num_heads=num_heads, proj_drop=drop, cos_attn=cos_attn)
         self.using_swiglu = swiglu
-        self.ffn = (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio / 256) * 256, drop=drop, fused_mlp=fused_mlp)
+        hidden = round(embed_dim * mlp_ratio / 256) * 256
+        self.task_id = task_id
+        self.ffns = nn.ModuleList([
+            (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=hidden, out_features=embed_dim, drop=drop, fused_mlp=fused_mlp),
+            (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=hidden, out_features=embed_dim, drop=drop, fused_mlp=fused_mlp),
+        ])
+        # self.ffn = (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio / 256) * 256, drop=drop, fused_mlp=fused_mlp)
         
         self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
         self.fused_norm_func = fused_norm_func
@@ -540,7 +532,7 @@ class CrossAttnBlock(nn.Module):
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
-        with torch.amp.autocast('cuda', enabled=False):    # disable half precision
+        with torch.cuda.amp.autocast(enabled=False):    # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
             else:
@@ -554,7 +546,7 @@ class CrossAttnBlock(nn.Module):
                 x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
-            x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+            x = x + self.drop_path(self.ffns[self.task_id]( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         else:
             x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
             if self.checkpointing_sa_only and self.training:
@@ -563,7 +555,7 @@ class CrossAttnBlock(nn.Module):
                 x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
-            x = x + self.drop_path(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+            x = x + self.drop_path(self.ffns[self.task_id](self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         return x
     
     def extra_repr(self) -> str:
@@ -587,6 +579,44 @@ class AdaLNBeforeHead(nn.Module):
         else:
             return self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x_BLC, scale=scale, shift=shift)
 
+# class AdaLNSelfAttn(nn.Module):
+#     def __init__(
+#         self, block_idx, last_drop_p, embed_dim, cond_dim, shared_aln: bool, norm_layer,
+#         num_heads, mlp_ratio=4., drop=0., attn_drop=0., drop_path=0., attn_l2_norm=False,
+#         flash_if_available=False, fused_if_available=True,
+#     ):
+#         """
+#         copy from CAR
+#         """
+#         super(AdaLNSelfAttn, self).__init__()
+#         self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
+#         self.C, self.D = embed_dim, cond_dim
+#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+#         self.attn = SelfAttention(block_idx=block_idx, embed_dim=embed_dim, num_heads=num_heads, attn_drop=attn_drop, proj_drop=drop, attn_l2_norm=attn_l2_norm, flash_if_available=flash_if_available)
+#         self.ffn = FFN(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio), drop=drop, fused_if_available=fused_if_available)
+        
+#         self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
+#         self.shared_aln = shared_aln
+#         if self.shared_aln:
+#             self.ada_gss = nn.Parameter(torch.randn(1, 1, 6, embed_dim) / embed_dim**0.5)
+#         else:
+#             lin = nn.Linear(cond_dim, 6*embed_dim)
+#             self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin)
+        
+#         self.fused_add_norm_fn = None
+    
+#     # NOTE: attn_bias is None during inference because kv cache is enabled
+#     def forward(self, x, cond_BD, attn_bias):   # C: embed_dim, D: cond_dim
+#         if self.shared_aln:
+#             gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
+#         else:
+#             gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
+#         x = x + self.drop_path(self.attn( self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1), attn_bias=attn_bias ).mul_(gamma1))
+#         x = x + self.drop_path(self.ffn( self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed when FusedMLP is used
+#         return x
+    
+#     def extra_repr(self) -> str:
+#         return f'shared_aln={self.shared_aln}'
 
 def main():
     dev = 'cpu' # 'cuda' if torch.cuda.is_available() else 'cpu'

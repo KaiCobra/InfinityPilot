@@ -36,18 +36,67 @@ def generate_run_id(exp_name):
 #         id=generate_run_id(exp_name),
 #         resume="allow",
 #     )
-def initialize(args, exp_name, project_name):
+def initialize(args, exp_name, project_name,):
     """初始化 W&B 運行"""
     print("[DEBUG] initialize wandb, rank=", dist.get_rank() if dist.is_initialized() else 'N/A')
-    os.environ['WANDB_MODE'] = 'online'  # 強制在線模式
-    print("[DEBUG] WANDB_MODE:", os.environ.get("WANDB_MODE"))
+    
+    # 檢查是否為離線模式
+    wandb_mode = os.environ.get('WANDB_MODE', 'online')
+    print("[DEBUG] WANDB_MODE:", wandb_mode)
+    
     config_dict = {k: v for k, v in vars(args).items() if not k.startswith('_')}
-    wandb.login(key='318c6ab88c39d7e5761e620e142c77ed7b75541e')
-    wandb.init(
-        project=project_name,
-        name=exp_name,
-        config=config_dict
-    )
+    
+    if wandb_mode == 'offline':
+        print("[DEBUG] Running in offline mode")
+        wandb.init(
+            settings=wandb.Settings(mode=wandb_mode),
+            project=project_name,
+            name=exp_name,
+            config=config_dict
+        )
+        return
+    
+        # 在線模式：嘗試登錄並處理錯誤
+    try:
+        # 檢查環境變量
+        api_key = os.environ.get('WANDB_API_KEY')
+        entity = os.environ.get('WANDB_ENTITY')
+        print(f"[DEBUG] API Key present: {bool(api_key)}")
+        print(f"[DEBUG] Entity: {entity}")
+        
+        print("[DEBUG] Attempting online login...")
+        wandb.login(key=api_key, relogin=True)
+        print("[DEBUG] Successfully logged in to wandb")
+        
+        print("[DEBUG] Attempting wandb.init...")
+        wandb.init(
+            project=project_name,
+            name=exp_name,
+            config=config_dict,
+            entity=entity,
+            sync_tensorboard=args.sync_tensorboard
+        )
+        print("[DEBUG] Successfully initialized wandb in online mode")
+        print(f"[DEBUG] Run URL: {wandb.run.url if wandb.run else 'N/A'}")
+        
+    except Exception as e:
+        print(f"[WARNING] Failed to initialize wandb in online mode: {e}")
+        print(f"[DEBUG] Exception type: {type(e).__name__}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        print("[INFO] Falling back to offline mode")
+        
+        # 確保清理之前的狀態
+        if wandb.run is not None:
+            wandb.finish()
+            
+        wandb.init(
+            mode='offline',
+            project=project_name,
+            name=exp_name,
+            config=config_dict
+        )
+        print("[DEBUG] Successfully initialized wandb in offline mode")
 
 def log_metrics(metrics: Dict[str, Any], step: Optional[int] = None) -> None:
     # print("[DEBUG] log_metrics called, metrics:", metrics)

@@ -1,0 +1,24 @@
+# InfinityPilot 配置示例
+# 請根據您的實際環境修改以下路徑
+
+# 模型設置
+model_path: "/path/to/your/infinity_pilot_model.pth"
+vae_path: "/path/to/your/vae_model.pth"
+text_encoder_ckpt: "/path/to/your/t5_encoder"
+model_type: "infinity_pilot_2b"
+
+# 生成參數
+pn: "1M"  # 解析度設置
+cfg: 3.5  # CFG 強度
+tau: 1.0  # 採樣溫度
+seed: 42  # 隨機種子
+
+# 輸出設置
+output_dir: "./output"
+save_format: "jpg"
+
+# 進階設置
+bf16: true
+enable_positive_prompt: true
+use_flex_attn: false
+sampling_per_bits: 1
