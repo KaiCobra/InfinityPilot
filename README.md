@@ -1,4 +1,4 @@
-# InfinityPilot🚀
+# InfinityPilot🚀: To Infinity and Beyond.
 This work is based on:
 - [Infinity ∞ : Scaling Bitwise AutoRegressive Modeling for High-Resolution Image Synthesis](https://github.com/FoundationVision/Infinity)  
 - [CAR🚗: Controllable AutoRegressive Modeling for Visual Generation](https://github.com/MiracleDance/CAR)  
