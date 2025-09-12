@@ -33,6 +33,8 @@ debug/
 CAR/
 notes/
 sdxl/
+misc_imgs/
+.github/
 
 
 # Python bytecode
