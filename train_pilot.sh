@@ -1,4 +1,9 @@
-conda activate infinity-clean;
+#!/bin/bash
+
+# check the time and insert to exp name
+date=$(date +%Y%m%d_%H%M%S)
+
+
 torchrun \
     --nproc_per_node=1 --nnodes=1 --node_rank=0 \
     --master_addr=127.0.0.1 --master_port=12347 \
@@ -18,15 +23,12 @@ torchrun \
     --local_out_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/VAR_ckpt/local_output/pilot \
     --task_type=t2i \
     --bed=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/VAR_ckpt/checkpoints/pilot \
-    # --data_path=data/infinity_toy_data/splits \
     --data_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/SynData/real_data/combined_splits_by_ratio \
     --video_data_path= \
-    --exp_name=pilot_debug \
-    --project_name=SceneTxtVAR_Debug \
-    --tblr=1e-4 \  
-    # 降低學習率以避免 NaN
+    --exp_name=pilot_debug_$date \
+    --project_name=InfinityPilot \
+    --tblr=1e-3 \
     --pn=0.06M \
-    # --model=infinity_pilot_2b \
     --model=2bc8 \
     --lbs=8 \
     --workers=8 \
@@ -52,7 +54,6 @@ torchrun \
     --always_training_scales=7 \
     --use_bit_label=1 \
     --zero=0 \
-    # --save_model_iters_freq=1000 \
     --save_car_epoch_freq=1 \
     --log_freq=50 \
     --checkpoint_type=torch \
@@ -62,5 +63,4 @@ torchrun \
     --apply_spatial_patchify=0 \
     --use_flex_attn=False \
     --pad=128 \
-    # --car_resume_path=/path/to/your/car_weights.pth \  # 可選：載入預訓練的 CAR 權重
     --save_car_separately=True

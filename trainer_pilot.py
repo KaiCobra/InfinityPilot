@@ -32,7 +32,7 @@ except ImportError:
 
 # Import parameter visualizer
 try:
-    from parameter_visualizer import ParameterChangeVisualizer
+    from debug_utils.parameter_visualizer import ParameterChangeVisualizer
     VISUALIZER_AVAILABLE = True
 except ImportError:
     VISUALIZER_AVAILABLE = False
@@ -45,6 +45,8 @@ from infinity.models.bitwise_self_correction import BitwiseSelfCorrection
 from infinity.utils import arg_util, misc, wandb_utils
 from infinity.utils.amp_opt import AmpOptimizer
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
+from debug_utils.training_visualizer import _generate_training_visualization
+
 
 Ten = torch.Tensor
 FTen = torch.Tensor
@@ -161,9 +163,9 @@ class InfinityPilotTrainer(object):
                 underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
                 self.param_visualizer = ParameterChangeVisualizer(
                     underlying_model, 
-                    save_dir=f"./debug/param_visualizations_{time.strftime('%Y%m%d_%H%M%S')}"
+                    save_dir=f"./debug/param_visualizations_{time.strftime('%m%d_%H%M%S')}"
                 )
-                print("✅ Parameter visualizer initialized")
+                # print("✅ Parameter visualizer initialized")
             except Exception as e:
                 print(f"⚠️ Failed to initialize parameter visualizer: {e}")
                 self.param_visualizer = None
@@ -394,10 +396,6 @@ class InfinityPilotTrainer(object):
         inp_B3HW: FTen, condition_B3HW: Optional[FTen], text_cond_tuple: Union[ITen, FTen], args: arg_util.Args,
     ) -> Tuple[torch.Tensor, Optional[float]]:
         
-        # Debug parameter freeze status at the beginning of training steps
-        if it <= 2 and ep == 0:  # Only check first few iterations of first epoch
-            self._debug_parameter_freeze_status(it)
-        
         B = inp_B3HW.shape[0]  # if isinstance(inp_B3HW, torch.Tensor) else inp_B3HW[0].shape[0]
         T = 1 if inp_B3HW.dim() == 4 else inp_B3HW.shape[2]
         V = self.vae_local.vocab_size
@@ -550,23 +548,31 @@ class InfinityPilotTrainer(object):
                     print(f"⚠️ Visualization error at iteration {g_it}: {e}")
         
         # Debug parameter freeze status for first few iterations
-        if it <= 2 and ep == 0 and dist.is_master():
+        if it % 100 == 0 and ep == 0 and dist.is_master():
             self._debug_parameter_freeze_status(it)
+            # [visualize] the result in wandb
+            self.generate_training_visualization(
+                ep, it, g_it, 
+                inp_B3HW, condition_B3HW, 
+                gt_ms_idx_Bl, text_cond_tuple, 
+                scale_schedule, training_scales, training_seq_len
+            )
+
         
         # Debug: Check parameter gradient status for DDP
-        if stepping and args.dbg and it < 3:  # Only for first few iterations
-            grad_params = []
-            no_grad_params = []
-            gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-            for name, param in gpt_uncompiled.named_parameters():
-                if param.requires_grad:
-                    if param.grad is not None:
-                        grad_params.append(name)
-                    else:
-                        no_grad_params.append(name)
-            print(f"[DEBUG] Iteration {it}: {len(grad_params)} params with grad, {len(no_grad_params)} params without grad")
-            if no_grad_params:
-                print(f"[DEBUG] No grad params: {no_grad_params[:5]}...")  # Show first 5
+        # if stepping and args.dbg and it < 3:  # Only for first few iterations
+        #     grad_params = []
+        #     no_grad_params = []
+        #     gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
+        #     for name, param in gpt_uncompiled.named_parameters():
+        #         if param.requires_grad:
+        #             if param.grad is not None:
+        #                 grad_params.append(name)
+        #             else:
+        #                 no_grad_params.append(name)
+            # print(f"[DEBUG] Iteration {it}: {len(grad_params)} params with grad, {len(no_grad_params)} params without grad")
+            # if no_grad_params:
+            #     print(f"[DEBUG] No grad params: {no_grad_params[:5]}...")  # Show first 5
         
         # update ema
         if args.use_fsdp_model_ema:
@@ -905,9 +911,6 @@ class InfinityPilotTrainer(object):
     
     def _debug_parameter_freeze_status(self, iteration: int):
         """调试参数冻结状态并验证optimizer内容"""
-        print(f"\n{'='*80}")
-        print(f"PARAMETER FREEZE & OPTIMIZER DEBUG - Iteration {iteration}")
-        print(f"{'='*80}")
         
         # 获取底层模型
         model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
@@ -961,52 +964,58 @@ class InfinityPilotTrainer(object):
                         infinity_in_optimizer.append(name)
                 else:
                     infinity_frozen.append(name)
-        
+        verbose = False
         # 打印详细统计
-        print(f"📊 PARAMETER ANALYSIS:")
-        print(f"   Total model parameters: {len(model_params)}")
-        print(f"   Total params in optimizer: {len(optimizer_param_ids)}")
-        print()
-        
-        print(f"🔥 CAR MODULE STATUS:")
-        print(f"   CAR trainable: {len(car_trainable)}")
-        print(f"   CAR frozen: {len(car_frozen)}")
-        print(f"   CAR in optimizer: {len(car_in_optimizer)}")
-        if car_frozen:
-            print(f"   ❌ CAR frozen params (should be trainable): {car_frozen[:5]}")
-        if len(car_trainable) != len(car_in_optimizer):
-            print(f"   ❌ CAR trainable/optimizer mismatch!")
-        
-        print(f"\n❄️  INFINITY MODULE STATUS:")
-        print(f"   Infinity trainable: {len(infinity_trainable)}")
-        print(f"   Infinity frozen: {len(infinity_frozen)}")
-        print(f"   Infinity in optimizer: {len(infinity_in_optimizer)}")
+        if verbose:
+            print(f"📊 PARAMETER ANALYSIS:")
+            print(f"   Total model parameters: {len(model_params)}")
+            print(f"   Total params in optimizer: {len(optimizer_param_ids)}")
+            print()
+            
+            print(f"🔥 CAR MODULE STATUS:")
+            print(f"   CAR trainable: {len(car_trainable)}")
+            print(f"   CAR frozen: {len(car_frozen)}")
+            print(f"   CAR in optimizer: {len(car_in_optimizer)}")
+            if car_frozen:
+                print(f"   ❌ CAR frozen params (should be trainable): {car_frozen[:5]}")
+            if len(car_trainable) != len(car_in_optimizer):
+                print(f"   ❌ CAR trainable/optimizer mismatch!")
+            
+            print(f"\n❄️  INFINITY MODULE STATUS:")
+            print(f"   Infinity trainable: {len(infinity_trainable)}")
+            print(f"   Infinity frozen: {len(infinity_frozen)}")
+            print(f"   Infinity in optimizer: {len(infinity_in_optimizer)}")
         
         if infinity_trainable:
             print(f"   ❌ PROBLEM: Infinity trainable params (should be frozen):")
             for name in infinity_trainable[:10]:
                 print(f"      - {name}")
+            raise RuntimeError(f"Infinity parameters are trainable: {infinity_trainable}")
+            
         
         if infinity_in_optimizer:
             print(f"   ❌ CRITICAL: Infinity params in optimizer:")
             for name in infinity_in_optimizer[:10]:
                 opt_info = optimizer_param_mapping.get(name, {})
                 print(f"      - {name} [Group: {opt_info.get('group', 'N/A')}]")
+            raise RuntimeError(f"Infinity parameters are in optimizer: {infinity_in_optimizer}")
         
-        # 特别检查：追踪参数变化
+
+        # =================================================
+        # Check params change
+        # =================================================
+        
         if not hasattr(self, '_param_snapshots'):
             self._param_snapshots = {}
         
-        # 保存当前参数快照
+        # save current snapshot of selected parameters
         current_snapshot = {}
         for name, param in model_params.items():
             if 'word_embed' in name or 'blocks.0.' in name:  # 采样一些Infinity参数
                 current_snapshot[name] = param.data.clone().detach()
         
-        # 比较参数变化
+        # Compare with previous snapshot
         if iteration > 0 and hasattr(self, '_param_snapshots'):
-            print(f"\n📈 PARAMETER CHANGE DETECTION (since last check):")
-            changes_detected = False
             
             for name, current_tensor in current_snapshot.items():
                 if name in self._param_snapshots:
@@ -1016,24 +1025,16 @@ class InfinityPilotTrainer(object):
                     if diff > 1e-8:  # 检测到变化
                         is_car = any(prefix in name for prefix in ['car_', 'control_'])
                         status = "✅ Expected" if is_car else "❌ UNEXPECTED"
-                        print(f"   {status}: {name} changed by {diff:.2e}")
-                        changes_detected = True
-            
-            if not changes_detected:
-                print(f"   ✅ No parameter changes detected in sampled Infinity params")
+                        # print(f"   {status}: {name} changed by {diff:.2e}")
+                        if not is_car:
+                            raise RuntimeError(f"Infinity parameter '{name}' changed during training!   {status}: {name} changed by {diff:.2e}")
         
-        # 更新快照
+        # update snapshot
         self._param_snapshots = current_snapshot
-        
-        # 检查EMA状态
-        if hasattr(self, 'ema') and self.ema is not None:
-            print(f"\n🔄 EMA STATUS:")
-            print(f"   EMA enabled: Yes")
-            print(f"   ⚠️  EMA updates ALL parameters (including frozen ones)")
-            print(f"   This is normal and doesn't affect training gradients")
-        
-        # 检查gradient状态
-        print(f"\n🎯 GRADIENT VERIFICATION:")
+
+        # =================================================
+        # Check gradient status
+        # =================================================
         has_grad_infinity = 0
         has_grad_car = 0
         no_grad_infinity = 0
@@ -1054,14 +1055,28 @@ class InfinityPilotTrainer(object):
                 else:
                     no_grad_infinity += 1
         
-        print(f"   CAR params with gradients: {has_grad_car}")
-        print(f"   CAR params without gradients: {no_grad_car}")
-        print(f"   Infinity params with gradients: {has_grad_infinity}")
-        print(f"   Infinity params without gradients: {no_grad_infinity}")
         
         if has_grad_infinity > 0:
-            print(f"   ❌ CRITICAL: Infinity parameters have gradients!")
-        else:
-            print(f"   ✅ CORRECT: No gradients on Infinity parameters")
-        
-        print("="*80)
+            raise RuntimeError(f"Infinity parameters have gradients! Count: {has_grad_infinity}")
+
+    def generate_training_visualization(self, ep: int, it: int, g_it: int, 
+                                    inp_B3HW: torch.Tensor, condition_B3HW: Optional[torch.Tensor], 
+                                    gt_ms_idx_Bl: List[torch.Tensor], text_cond_tuple: Tuple[torch.Tensor, torch.Tensor], 
+                                    scale_schedule: List[Tuple[int, int, int]], training_scales: int, training_seq_len: int):
+        """Generate training visualization using current step results"""
+        # Only run on master process to avoid duplicate visualizations
+        if not dist.is_master():
+            return None
+            
+        try:
+            return _generate_training_visualization(
+                self, ep, it, g_it, 
+                inp_B3HW, condition_B3HW, 
+                gt_ms_idx_Bl, text_cond_tuple, 
+                scale_schedule, training_scales, training_seq_len
+            )
+        except Exception as e:
+            print(f"⚠️ Visualization generation error at iteration {g_it}: {e}")
+            import traceback
+            traceback.print_exc()
+        return None
