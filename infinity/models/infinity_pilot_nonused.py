@@ -1,5 +1,5 @@
 """
-Definition of Infinity transformer model.(original version)
+Definition of Infinity transformer model.
 """
 
 import math
@@ -33,7 +33,11 @@ except:
 from infinity.models.infinity import Infinity
 from infinity.utils.control_data_utils import numpy_to_pt, pil_to_numpy
 
-
+def detect_infinity_arch_flags(state_dict: dict):
+    has_ada_gss = any('ada_gss' in k for k in state_dict)
+    has_shared_ada_lin = any('shared_ada_lin' in k for k in state_dict)
+    has_individual_ada_lin = any(('ada_lin' in k) and ('shared_ada_lin' not in k) for k in state_dict)
+    return has_ada_gss, has_shared_ada_lin, has_individual_ada_lin
 
 def get_control_for_each_scale(control_image, scale):
     """
@@ -183,7 +187,7 @@ class InfinityPilot(Infinity):
         apply_spatial_patchify (int, default=0): If True, apply spatial patchification.
         inference_mode (bool, default=False): If True, set model to inference mode.
     """
-    def __init__(self, infinity_base_model: Optional['Infinity'] = None, init_car_modules=False, freeze_infinity=True, **kwargs):
+    def __init__(self, infinity_base_model: Optional['Infinity'] = None, init_car_modules=True, freeze_infinity=True, **kwargs):
         """
         Args:
             infinity_base_model: 預訓練的 Infinity 基礎模型，如果提供則會復制其參數
@@ -220,7 +224,6 @@ class InfinityPilot(Infinity):
         
         # 保存所需的參數以便在建立控制塊時使用
         self._init_kwargs = kwargs.copy()
-        self.car_condition_channels = kwargs.get('car_condition_channels', 3)
         
         print(f"[InfinityPilot] Initializing with shared_aln={kwargs.get('shared_aln', False)}")
 
@@ -230,16 +233,22 @@ class InfinityPilot(Infinity):
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
         super().__init__(**filtered_kwargs)
         
-        self.num_block_chunks = kwargs.get('block_chunks', 1)
+        self.num_block_chunks = kwargs.get('block_chunks', 16)
         
+
+        # load base model weights if provided
         if infinity_base_model is not None:
             self.load_infinity_weights(infinity_base_model)
         
-        # 凍結 Infinity 基礎模型參數
-        if freeze_infinity:
-            self.freeze_infinity_parameters()
+        # # 凍結 Infinity 基礎模型參數
+        # if freeze_infinity:
+        #     self.freeze_infinity_parameters()
+        
+        if car_ckpt_pth and os.path.exists(car_ckpt_pth):
+            pass
         
         if init_car_modules:
+            self.car_depth = kwargs.get('car_depth', self.depth // 2)
             self._init_car_modules()
     
     def load_infinity_weights(self, infinity_model_or_state_dict):
@@ -411,125 +420,26 @@ class InfinityPilot(Infinity):
                 param.requires_grad = False
                 frozen_count += 1
         print(f"Frozen {frozen_count} Infinity base model parameters")
-    
-    def unfreeze_infinity_parameters(self):
-        """解凍 Infinity 基礎模型的參數"""
-        unfrozen_count = 0
-        for name, param in self.named_parameters():
-            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
-                param.requires_grad = True
-                unfrozen_count += 1
-        print(f"Unfrozen {unfrozen_count} Infinity base model parameters")
-
-    def special_car_init(self, args):
-        """保留介面，不額外覆寫 Xavier 初始化。"""
-        print("[CAR init] Skipping special_car_init; using default Xavier initialization.")
-
-    def _init_car_parameters(self):
-        """為 CAR 子模組執行顯式初始化，避免未初始化權重導致數值異常。"""
-        def init_fn(module):
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Conv2d):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, (nn.LayerNorm, FP32_Layernorm)):
-                if module.elementwise_affine:
-                    nn.init.ones_(module.weight)
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, FastRMSNorm):
-                if module.elementwise_affine:
-                    nn.init.ones_(module.weight)
         
-        for block in self.car_blocks:
-            block.apply(init_fn)
-        self.car_skip_linear.apply(init_fn)
-
-    def _init_car_blocks_from_transformer(self):
-        """
-        用 Layer Merge 方式從 blocks 初始化 car_blocks
-        """
-        
-        step = self.depth // self.car_depth
-        
-        print(f"[car_init] merging from {self.depth} transformer blocks -> {self.car_depth} car blocks")
-        with torch.no_grad():
-            for i in range(self.car_depth):
-                merged = {}
-                idx_a = i * step
-                idx_b = min((i + 1) * step - 1, self.depth - 1)
-                wa = self.blocks[idx_a].state_dict()
-                wb = self.blocks[idx_b].state_dict()
-
-                for k in wa.keys():
-                    a = wa[k].float()
-                    b = wb[k].float()
-
-                    if torch.isnan(a).any() or torch.isinf(a).any():
-                        print(f"Warning: NaN or Inf detected in weights of block {idx_a}, key {k}")
-                        a = torch.nan_to_num(a)
-                        b = torch.nan_to_num(b)
-                    # 對 gating / scaling 參數採用偏淺層權重
-                    if "bias" in k:
-                        merged_v = torch.zeros_like(a)
-
-                    elif any(x in k for x in ["ada_gss", "scale_mul"]):
-                        merged_v = 1.0 * (0.8 * a + 0.2 * b)
-                    else:
-                        merged_v = 0.5 * (a + b)
-                    
-                    merged_v = torch.nan_to_num(merged_v)
-                    merged_v = torch.clamp(merged_v, -3.0, 3.0)
-                    merged[k] = merged_v.to(wa[k].dtype)
-
-                self.car_blocks[i].load_state_dict(merged)
-
-
     def _init_car_modules(self):
         """初始化 CAR 控制模塊"""
         # CAR control modules - 參考 CAR 的架構
-        init_kwargs = getattr(self, '_init_kwargs', {})
         conv_in_kernel = 3
         conv_in_padding = (conv_in_kernel - 1) // 2
-        control_in_channels = init_kwargs.get('car_condition_channels', getattr(self, 'car_condition_channels', 3))
-        self.car_control_convs = ControlConditionEmbedding(conditioning_embedding_channels=self.C, conditioning_channels=control_in_channels)
+        self.car_control_convs = ControlConditionEmbedding(conditioning_embedding_channels=self.C)
         self.car_var_conv = nn.Conv2d(self.C, self.C, kernel_size=conv_in_kernel, padding=conv_in_padding)
-        nn.init.xavier_uniform_(self.car_var_conv.weight)
-        if self.car_var_conv.bias is not None:
-            nn.init.zeros_(self.car_var_conv.bias)
-        nn.init.xavier_uniform_(self.car_control_convs.conv_out.weight)
-        if self.car_control_convs.conv_out.bias is not None:
-            nn.init.zeros_(self.car_control_convs.conv_out.bias)
 
         # 建立 CAR 控制塊 - 只建立 depth//2 個塊（與 CAR 一致）
         from functools import partial
         
         # Get parameters from kwargs or use defaults
+        init_kwargs = getattr(self, '_init_kwargs', {})
         norm_layer = partial(FastRMSNorm if init_kwargs.get('rms_norm', False) else nn.LayerNorm, eps=init_kwargs.get('norm_eps', 1e-6))
-        existing_depth = getattr(self, 'car_depth', None)
-        print(f"[debug] _init_car_modules called with kwargs.car_depth={init_kwargs.get('car_depth', None)} existing car_depth attr={existing_depth}")
-
-        def _to_positive_int(val):
-            try:
-                iv = int(val)
-            except (TypeError, ValueError):
-                return None
-            return iv if iv > 0 else None
-
-        init_depth = init_kwargs.get('car_depth', None)
-        chosen_depth = _to_positive_int(init_depth) or _to_positive_int(existing_depth)
-        if chosen_depth is None:
-            depth_val = _to_positive_int(getattr(self, 'depth', None))
-            chosen_depth = max(1, depth_val // 2) if depth_val is not None else 8
-
-        self.car_depth = chosen_depth
+        self.car_depth = getattr(self, 'car_depth', init_kwargs.get('car_depth', 8))
         print(f"[debug] CAR depth set to {self.car_depth}")
-
-        dpr = [x.item() for x in torch.linspace(0, init_kwargs.get('drop_path_rate', 0.0), self.car_depth)]
-
+        depth = getattr(self, 'depth', init_kwargs.get('depth', 16))
+        dpr = [x.item() for x in torch.linspace(0, init_kwargs.get('drop_path_rate', 0.0), depth)]
+        
         self.car_blocks = nn.ModuleList([
             (CrossAttnBlock if self.t2i else SelfAttnBlock)(
                 embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=init_kwargs.get('cross_attn_layer_scale', -1.), 
@@ -547,27 +457,16 @@ class InfinityPilot(Infinity):
             for block_idx in range(self.car_depth)
         ])
 
-        # 建立跳躍連接的線性層與 RMSNorm，並確保初始化為零輸出
+        # 建立跳躍連接的歸一化和線性層（與 CAR 一致）
+        car_norm_layer = FP32_Layernorm
+        car_skip_norm = []
         car_skip_linear = []
-        car_base_norms = []
-        car_ctrl_norms = []
         for _ in range(self.car_depth):
+            car_skip_norm.append(car_norm_layer(2 * self.C, elementwise_affine=True, eps=1e-6))
             car_skip_linear.append(nn.Linear(2 * self.C, self.C))
-            nn.init.xavier_uniform_(car_skip_linear[-1].weight)
-            if car_skip_linear[-1].bias is not None:
-                nn.init.zeros_(car_skip_linear[-1].bias)
-            car_base_norms.append(FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True))
-            car_ctrl_norms.append(FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True))
+        self.car_skip_norm = nn.ModuleList(car_skip_norm)
         self.car_skip_linear = nn.ModuleList(car_skip_linear)
-        self.car_skip_base_norm = nn.ModuleList(car_base_norms)
-        self.car_skip_ctrl_norm = nn.ModuleList(car_ctrl_norms)
-
-        # 分支正規化與殘差縮放，確保初期為微擾式調整
-        self.car_var_norm = FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True)
-        self.car_control_norm = FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True)
-        self.car_skip_scale = nn.Parameter(torch.full((self.car_depth,), 1e-3))
         
-        self._init_car_parameters()
         print(f"Initialized CAR modules with {len(self.car_blocks)} control blocks")
     
     def has_car_modules(self):
@@ -673,22 +572,15 @@ class InfinityPilot(Infinity):
         """
         self.control_tensors = control_tensors
 
-    def prepare_control_for_scales(self, control_image: Union[torch.Tensor, Dict[str, torch.Tensor]], scale_schedule: List[Tuple[int]]) -> Optional[List[torch.Tensor]]:
+    def prepare_control_for_scales(self, control_image: torch.Tensor, scale_schedule: List[Tuple[int]]) -> List[torch.Tensor]:
         """
         為每個尺度準備控制條件
         Args:
-            control_image: 原始控制圖像 [B, C, H, W] 或 dict 包含多種控制訊號
+            control_image: 原始控制圖像 [B, C, H, W]
             scale_schedule: 尺度排程
         Returns:
             每個尺度對應的控制張量列表
         """
-        if isinstance(control_image, dict):
-            control_image = self._combine_control_inputs(
-                control_image.get('normal'),
-                control_image.get('mask')
-            )
-        if control_image is None:
-            return None
         control_tensors = []
         for pt, ph, pw in scale_schedule:
             # 將控制圖像調整到對應尺度
@@ -699,27 +591,6 @@ class InfinityPilot(Infinity):
                 control_resized = control_resized * 2 - 1
             control_tensors.append(control_resized)
         return control_tensors
-
-    def _combine_control_inputs(self, normal_tensor: Optional[torch.Tensor], mask_tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """將多種控制訊號合併為固定通道數。"""
-        tensors = []
-        if normal_tensor is not None:
-            tensors.append(normal_tensor)
-        if mask_tensor is not None:
-            if mask_tensor.shape[1] == 1 and self.car_condition_channels > sum(t.shape[1] for t in tensors):
-                repeat = min(self.car_condition_channels - sum(t.shape[1] for t in tensors), 3)
-                mask_tensor = mask_tensor.repeat(1, repeat, 1, 1)
-            tensors.append(mask_tensor)
-        if not tensors:
-            return None
-        control = torch.cat(tensors, dim=1)
-        current_c = control.shape[1]
-        if current_c < self.car_condition_channels:
-            pad = self.car_condition_channels - current_c
-            control = torch.cat([control, control.new_zeros(control.shape[0], pad, control.shape[2], control.shape[3])], dim=1)
-        elif current_c > self.car_condition_channels:
-            control = control[:, :self.car_condition_channels]
-        return control
 
     def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC_wo_prefix: torch.Tensor, scale_schedule: List[Tuple[int]],
         cfg_infer=False, control_tensors: Optional[List[torch.Tensor]] = None,  **kwargs,
@@ -814,15 +685,8 @@ class InfinityPilot(Infinity):
                     control_f = F.interpolate(control_f, size=var_x.shape[-2:], mode='bilinear', align_corners=False)
                 
                 # 添加控制特徵
-                var_tokens = var_x.flatten(2).transpose(1, 2)
-                var_tokens = self.car_var_norm(var_tokens)
-                var_x = var_tokens.transpose(1, 2).reshape(B, self.C, *var_x.shape[-2:])
-
-                control_tokens = control_f.flatten(2).transpose(1, 2)
-                control_tokens = self.car_control_norm(control_tokens)
-                control_f = control_tokens.transpose(1, 2).reshape(B, self.C, *control_f.shape[-2:])
-
-                car_x = (var_x + control_f).view(B, self.C, -1).transpose(1, 2).contiguous()
+                car_x = var_x + control_f
+                car_x = car_x.view(B, self.C, -1).transpose(1, 2).contiguous()
                 car_input_list.append(car_x)
             
             # 連接所有尺度的控制輸入
@@ -850,17 +714,14 @@ class InfinityPilot(Infinity):
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 
-                # 在後半部分塊中融合控制特徵 [TODO]
+                # 在後半部分塊中融合控制特徵
                 if control_tensors is not None and i >= len(self.blocks) - self.car_depth:
                     skip_idx = i - (len(self.blocks) - self.car_depth)
                     if skip_idx < len(control_residual_f):
                         con_f = control_residual_f[skip_idx]
-                        base_norm = self.car_skip_base_norm[skip_idx](x_BLC)
-                        ctrl_norm = self.car_skip_ctrl_norm[skip_idx](con_f)
-                        cat = torch.cat([base_norm, ctrl_norm], dim=-1)
-                        delta = self.car_skip_linear[skip_idx](cat)
-                        scale = self.car_skip_scale[skip_idx].view(1, 1, 1)
-                        x_BLC = x_BLC + scale * delta
+                        cat = torch.cat([x_BLC, con_f], dim=-1)
+                        cat = self.car_skip_norm[skip_idx](cat)
+                        x_BLC = self.car_skip_linear[skip_idx](cat)
                 
                 if checkpointing_full_block:
                     x_BLC = torch.utils.checkpoint.checkpoint(b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
@@ -878,12 +739,9 @@ class InfinityPilot(Infinity):
                     skip_idx = i - self.num_block_chunks // 2
                     if skip_idx < len(control_residual_f):
                         con_f = control_residual_f[skip_idx]
-                        base_norm = self.car_skip_base_norm[skip_idx](x_BLC)
-                        ctrl_norm = self.car_skip_ctrl_norm[skip_idx](con_f)
-                        cat = torch.cat([base_norm, ctrl_norm], dim=-1)
-                        delta = self.car_skip_linear[skip_idx](cat)
-                        scale = self.car_skip_scale[skip_idx].view(1, 1, 1)
-                        x_BLC = x_BLC + scale * delta
+                        cat = torch.cat([x_BLC, con_f], dim=-1)
+                        cat = self.car_skip_norm[skip_idx](cat)
+                        x_BLC = self.car_skip_linear[skip_idx](cat)
                 
                 x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
 

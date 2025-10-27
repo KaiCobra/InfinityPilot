@@ -16,6 +16,8 @@ def debug_parameter_freeze_status(gpt_wo_ddp):
             if param.requires_grad and not any(car_prefix in name for car_prefix in ['car_', 'control_']):
                 print(f"    - {name}")
 
+    del infinity_trainable, car_trainable
+
 def debug_parameter_number(gpt_wo_ddp):
     """Debug utility to print out the total number of parameters."""
     infinity_params = sum(p.numel() for name, p in gpt_wo_ddp.named_parameters() 
@@ -29,5 +31,6 @@ def debug_parameter_number(gpt_wo_ddp):
     
     print(f'[PT][#para] Infinity: {infinity_params/1e6:.2f}M (trainable: {trainable_infinity/1e9:.2f}B)')
     print(f'[PT][#para] CAR: {car_params/1e6:.2f}M (trainable: {trainable_car/1e6:.2f}M)')
+    del infinity_params, car_params, trainable_infinity, trainable_car
     print()
     

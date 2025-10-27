@@ -12,10 +12,10 @@ Huge thanks to my senior [Theo the Bear] for all the support and advice.
 
 ## The model architecture
 <p align="center">
-  <img src="./assets/pilot_architecture.png" width="800"/>
+  <img src="./assets/image.png" width="800"/>
   <br>
   <i>
-        Architecture overview.  
+        Architecture overview.
         Stage 1: The model is pretrained using text segmentation, normal maps, and original images, while sharing QKV weights across the three Transformers.  
         Stage 2: During inference, we integrate the CAR modules.
     </i>

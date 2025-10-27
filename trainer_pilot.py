@@ -4,7 +4,7 @@ import gc
 import os.path as osp
 from functools import partial
 from pprint import pformat
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 from collections import defaultdict
 
 import seaborn as sns
@@ -157,7 +157,8 @@ class InfinityPilotTrainer(object):
         
         # Initialize parameter visualizer if available
         self.param_visualizer = None
-        if VISUALIZER_AVAILABLE and dist.is_master():
+        if False:
+        # if VISUALIZER_AVAILABLE and dist.is_master() and False:
             try:
                 # Get the underlying model without DDP/FSDP wrapper
                 underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
@@ -175,7 +176,7 @@ class InfinityPilotTrainer(object):
 
     @torch.no_grad()
     def _generate_eval_visualization(self, ep: int, eval_images: List[torch.Tensor], 
-                                   eval_conditions: List[torch.Tensor], eval_prompts: List[str], args):
+                                   eval_conditions: List[Optional[Dict[str, torch.Tensor]]], eval_prompts: List[str], args):
         """Generate visualization images during evaluation and log to wandb/tensorboard"""
         try:
             print(f"Generating evaluation visualization for epoch {ep}...")
@@ -196,7 +197,7 @@ class InfinityPilotTrainer(object):
                     # Prepare inputs
                     orig_img = orig_img.to(args.device)
                     if condition is not None:
-                        condition = condition.to(args.device)
+                        condition = {k: v.to(args.device) for k, v in condition.items() if v is not None}
                     
                     # Determine scale schedule
                     h_div_w = orig_img.shape[-2] / orig_img.shape[-1]
@@ -322,31 +323,40 @@ class InfinityPilotTrainer(object):
         
         for batch_idx, data in enumerate(ld_val):
             # Handle data format for pilot (with condition)
-            if len(data) == 3:
-                inp, condition, label_B = data
+            condition_inputs = {}
+            if len(data) == 4:
+                inp, condition_mask, condition_normal, label_B = data
+            elif len(data) == 3:
+                inp, condition_normal, label_B = data
+                condition_mask = None
             else:
                 inp, label_B = data
-                condition = None
+                condition_mask = None
+                condition_normal = None
             
             B = label_B.shape[0] if isinstance(label_B, torch.Tensor) else inp.shape[0]
             if isinstance(label_B, torch.Tensor):
                 label_B = label_B.to(args.device, non_blocking=True)
             V = self.vae_local.vocab_size
             inp = inp.to(args.device, non_blocking=True)
-            if condition is not None:
-                condition = condition.to(args.device, non_blocking=True)
+            if condition_normal is not None:
+                condition_normal = condition_normal.to(args.device, non_blocking=True)
+                condition_inputs['normal'] = condition_normal
+            if condition_mask is not None:
+                condition_mask = condition_mask.to(args.device, non_blocking=True)
+                condition_inputs['mask'] = condition_mask
             
             gt_ms_idx_Bl: List[Ten] = self.vae_local.get_GPT_ground_truth(inp)
             
             gt_BL = torch.cat(gt_ms_idx_Bl, dim=1)
             
             # Prepare control tensors for InfinityPilot
-            if condition is not None:
+            if condition_inputs:
                 h_div_w = inp.shape[-2] / inp.shape[-1]
                 h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
                 h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
                 scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
-                control_tensors = self.gpt_wo_ddp.prepare_control_for_scales(condition, scale_schedule)
+                control_tensors = self.gpt_wo_ddp.prepare_control_for_scales(condition_inputs, scale_schedule)
             else:
                 control_tensors = None
                 # Use default scale schedule if no condition
@@ -370,10 +380,10 @@ class InfinityPilotTrainer(object):
                 # Store original images, conditions, and generate samples for visualization
                 for i in range(min(B, max_vis_samples - len(eval_images))):
                     eval_images.append(inp[i:i+1].cpu())  # Keep original image
-                    if condition is not None:
-                        eval_conditions.append(condition[i:i+1].cpu())
-                    else:
-                        eval_conditions.append(None)
+                if condition_inputs:
+                    eval_conditions.append({k: v[i:i+1].cpu() for k, v in condition_inputs.items()})
+                else:
+                    eval_conditions.append(None)
                     eval_prompts.append(f"Sample_{len(eval_images)}")
                     
         self.gpt_wo_ddp.train(training)
@@ -393,7 +403,7 @@ class InfinityPilotTrainer(object):
     def train_step(
         self, ep: int, it: int, g_it: int, stepping: bool, clip_decay_ratio: float,
         metric_lg: misc.MetricLogger, logging_params: bool,
-        inp_B3HW: FTen, condition_B3HW: Optional[FTen], text_cond_tuple: Union[ITen, FTen], args: arg_util.Args,
+        inp_B3HW: FTen, condition_inputs: Optional[Dict[str, torch.Tensor]], text_cond_tuple: Union[ITen, FTen], args: arg_util.Args,
     ) -> Tuple[torch.Tensor, Optional[float]]:
         
         B = inp_B3HW.shape[0]  # if isinstance(inp_B3HW, torch.Tensor) else inp_B3HW[0].shape[0]
@@ -427,8 +437,8 @@ class InfinityPilotTrainer(object):
 
             # Prepare control tensors for InfinityPilot
             control_tensors = None
-            if condition_B3HW is not None:
-                control_tensors = self.gpt_wo_ddp.prepare_control_for_scales(condition_B3HW, scale_schedule[:training_scales])
+            if condition_inputs is not None:
+                control_tensors = self.gpt_wo_ddp.prepare_control_for_scales(condition_inputs, scale_schedule[:training_scales])
 
             self.gpt_wo_ddp.forward  
             
@@ -476,7 +486,7 @@ class InfinityPilotTrainer(object):
                 car_param_count = 0
                 infinity_param_count = 0
                 for name, param in gpt_uncompiled.named_parameters():
-                    if any(car_prefix in name for car_prefix in ['car_control_convs', 'car_var_conv', 'car_blocks', 'car_skip_norm', 'car_skip_linear']):
+                    if any(car_prefix in name for car_prefix in ['car_']):
                         param.requires_grad = True
                         car_param_count += 1
                     else:
@@ -493,53 +503,159 @@ class InfinityPilotTrainer(object):
             gt_BL = torch.cat(gt_ms_idx_Bl, dim=1)[:,:training_seq_len].contiguous().type(torch.long) # [bs, 1*1+...+64*64, 16] or [bs, 1*1+...+64*64]
             
             # 檢查 logits 是否包含 NaN 或 inf
-            if not torch.isfinite(logits_BLV).all():
-                print(f"[ERROR] Non-finite values in logits_BLV")
-                print(f"[DEBUG] logits_BLV contains nan: {torch.isnan(logits_BLV).any()}")
-                print(f"[DEBUG] logits_BLV contains inf: {torch.isinf(logits_BLV).any()}")
-                print(f"[DEBUG] logits_BLV min: {logits_BLV.min()}")
-                print(f"[DEBUG] logits_BLV max: {logits_BLV.max()}")
-                raise RuntimeError("Non-finite values in logits before loss calculation")
+            # if not torch.isfinite(logits_BLV).all():
+            #     print(f"[ERROR] Non-finite values in logits_BLV")
+            #     print(f"[DEBUG] logits_BLV contains nan: {torch.isnan(logits_BLV).any()}")
+            #     print(f"[DEBUG] logits_BLV contains inf: {torch.isinf(logits_BLV).any()}")
+            #     print(f"[DEBUG] logits_BLV min: {logits_BLV.min()}")
+            #     print(f"[DEBUG] logits_BLV max: {logits_BLV.max()}")
+            #     raise RuntimeError("Non-finite values in logits before loss calculation")
             
             # 檢查 logits 的數值範圍，如果過大可能導致數值不穩定
-            logits_max = logits_BLV.max().item()
-            logits_min = logits_BLV.min().item()
-            if abs(logits_max) > 100 or abs(logits_min) > 100:
-                print(f"[WARNING] Large logits values detected: min={logits_min:.2f}, max={logits_max:.2f}")
+            # logits_max = logits_BLV.max().item()
+            # logits_min = logits_BLV.min().item()
+            # if abs(logits_max) > 100 or abs(logits_min) > 100:
+            #     print(f"[WARNING] Large logits values detected: min={logits_min:.2f}, max={logits_max:.2f}")
             
             if args.use_bit_label:
                 tmp_bs, tmp_seq_len, tmp_channel = logits_BLV.shape
-                loss = self.train_loss(logits_BLV.reshape(tmp_bs, tmp_seq_len, -1, 2).permute(0,3,1,2), gt_BL)
+                raw_loss = self.train_loss(logits_BLV.reshape(tmp_bs, tmp_seq_len, -1, 2).permute(0,3,1,2), gt_BL)
                 if args.bitloss_type == 'mean':
-                    loss = loss.mean(dim=-1)
+                    raw_loss = raw_loss.mean(dim=-1)
                 elif args.bitloss_type == 'sum':
-                    loss = loss.sum(dim=-1)
+                    raw_loss = raw_loss.sum(dim=-1)
                 else:
                     raise NotImplementedError(f'{args.bitloss_type=}')
             else:
-                loss = self.train_loss(logits_BLV.reshape(-1, V), gt_BL.reshape(-1)).reshape(B, -1)
+                raw_loss = self.train_loss(logits_BLV.reshape(-1, V), gt_BL.reshape(-1)).reshape(B, -1)
+
+            # Guard against non-finite raw loss before weighting
+            # if not torch.isfinite(raw_loss).all():
+            #     print("[ERROR] Non-finite values detected in raw loss before weighting")
+            #     nan_mask = torch.isnan(raw_loss)
+            #     inf_mask = torch.isinf(raw_loss)
+            #     if torch.numel(raw_loss):
+            #         finite_mask = torch.isfinite(raw_loss)
+            #         print(f"[DEBUG] raw_loss finite ratio: {finite_mask.float().mean().item():.6f}")
+            #     print(f"[DEBUG] raw_loss contains nan: {nan_mask.any().item()}, inf: {inf_mask.any().item()}")
+            #     if torch.numel(raw_loss):
+            #         finite_vals = raw_loss[torch.isfinite(raw_loss)]
+            #         if finite_vals.numel() > 0:
+            #             print(f"[DEBUG] raw_loss finite stats -> min: {finite_vals.min().item()}, max: {finite_vals.max().item()}, mean: {finite_vals.mean().item()}, std: {finite_vals.std().item()}")
+            #     print(f"[DEBUG] logits_BLV stats -> shape: {tuple(logits_BLV.shape)}, min: {logits_BLV.min().item()}, max: {logits_BLV.max().item()}, mean: {logits_BLV.mean().item()}, std: {logits_BLV.std().item()}")
+            #     print(f"[DEBUG] gt_BL stats -> shape: {tuple(gt_BL.shape)}, dtype: {gt_BL.dtype}, min: {gt_BL.min().item()}, max: {gt_BL.max().item()}, unique count: {torch.unique(gt_BL).numel()}")
+            #     uniq_vals, counts = torch.unique(gt_BL, return_counts=True)
+            #     topk = min(10, uniq_vals.numel())
+            #     print(f"[DEBUG] gt_BL unique top {topk}: {list(zip(uniq_vals[:topk].tolist(), counts[:topk].tolist()))}")
+            #     if torch.any(nan_mask):
+            #         nan_indices = torch.nonzero(nan_mask)
+            #         print(f"[DEBUG] raw_loss nan count: {nan_indices.shape[0]}")
+            #         for idx in nan_indices[:5]:
+            #             idx_list = idx.tolist()
+            #             gt_val = None
+            #             if len(idx_list) <= gt_BL.dim():
+            #                 try:
+            #                     gt_val = gt_BL[tuple(idx_list[:gt_BL.dim()])].item()
+            #                 except Exception:
+            #                     gt_val = "unavailable"
+            #             print(f"[DEBUG] raw_loss nan at index {idx_list}, corresponding gt_BL: {gt_val}")
+            #     if args.use_bit_label:
+            #         print(f"[DEBUG] bit-label mode -> tmp_bs={tmp_bs}, tmp_seq_len={tmp_seq_len}, tmp_channel={tmp_channel}")
+            #     raise RuntimeError("Raw loss is not finite before applying scale weights")
 
             if self.reweight_loss_by_scale:
                 lw = []
                 last_scale_area = np.sqrt(np.prod(scale_schedule[-1]))
+                # print(f"last_scale_area: {last_scale_area}")
                 for (pt, ph, pw) in scale_schedule[:training_scales]:
                     this_scale_area = np.sqrt(pt * ph * pw)
                     lw.extend([last_scale_area / this_scale_area for _ in range(pt * ph * pw)])
-                lw = torch.tensor(lw, device=loss.device)[None, ...]
-                lw = lw / lw.sum()
+                lw = torch.tensor(lw, device=raw_loss.device, dtype=raw_loss.dtype).unsqueeze(0)
+                
+                total_w = lw.sum()
+                
+                lw = lw / total_w
+                weighted_loss = raw_loss.mul(lw)
             else:
+                print(f"else: {self.seq_len}")
                 lw = 1. / self.seq_len
-            loss = loss.mul(lw).sum(dim=-1).mean()
-        
+                weighted_loss = raw_loss * lw
+
+            # if not torch.isfinite(weighted_loss).all():
+            #     print("[ERROR] Non-finite values detected after applying loss weights")
+            #     print(f"[DEBUG] weighted_loss nan: {torch.isnan(weighted_loss).any().item()}, inf: {torch.isinf(weighted_loss).any().item()}")
+            #     print(f"[DEBUG] raw_loss stats -> min: {raw_loss.min().item()}, max: {raw_loss.max().item()}, mean: {raw_loss.mean().item()}")
+            #     if self.reweight_loss_by_scale:
+            #         print(f"[DEBUG] lw stats -> min: {lw.min().item()}, max: {lw.max().item()}, sum: {lw.sum().item()}, shape: {lw.shape}")
+            #         print(f"[DEBUG] scale_schedule[:{training_scales}]: {scale_schedule[:training_scales]}")
+            #     raise RuntimeError("Weighted loss is not finite")
+
+            loss = weighted_loss.sum(dim=-1).mean()
+
+            # if not torch.isfinite(loss).item():
+            #     print("[ERROR] Final scalar loss became non-finite")
+            #     print(f"[DEBUG] weighted_loss per-sample -> min: {weighted_loss.min().item()}, max: {weighted_loss.max().item()}, mean: {weighted_loss.mean().item()}")
+            #     print(f"[DEBUG] raw_loss per-token -> min: {raw_loss.min().item()}, max: {raw_loss.max().item()}, mean: {raw_loss.mean().item()}")
+            #     if self.reweight_loss_by_scale:
+            #         print(f"[DEBUG] lw stats -> min: {lw.min().item()}, max: {lw.max().item()}, sum: {lw.sum().item()}, shape: {lw.shape}")
+            #         print(f"[DEBUG] scale_schedule[:{training_scales}]: {scale_schedule[:training_scales]}")
+            #         print(f"[DEBUG] training_seq_len: {training_seq_len}, raw_loss.shape: {raw_loss.shape}, weighted_loss.shape: {weighted_loss.shape}")
+            #     raise RuntimeError("Final loss is not finite after reduction")
+
+            # if args.car_scale_reg > 0:
+            #     car_skip = None
+            #     car_depth_attr = getattr(args, 'car_depth', None)
+            #     if self.zero:
+            #         fsdp_module = self.gpt
+            #         with FSDP.summon_full_params(fsdp_module, writeback=False, recurse=False):
+            #             wrapped = getattr(fsdp_module, "module", None)
+            #             if wrapped is None:
+            #                 wrapped = getattr(fsdp_module, "_fsdp_wrapped_module", None)
+            #             if wrapped is not None and hasattr(wrapped, "car_skip_scale"):
+            #                 car_skip = wrapped.car_skip_scale.detach().clone()
+            #                 model_car_depth = getattr(wrapped, "car_depth", None)
+            #             else:
+            #                 model_car_depth = None
+            #     else:
+            #         model_car_depth = getattr(gpt_uncompiled, "car_depth", None)
+            #         car_skip = getattr(gpt_uncompiled, "car_skip_scale", None)
+
+            #     print(f"[DEBUG] CAR regularization check: args.car_scale_reg={args.car_scale_reg}, args.car_depth={car_depth_attr}, model.car_depth={model_car_depth}, car_skip_shape={tuple(car_skip.shape) if isinstance(car_skip, torch.Tensor) else None}")
+
+            #     if car_skip is None:
+            #         print("[WARNING] car_skip_scale is None while car_scale_reg > 0")
+            #     else:
+            #         if car_skip.numel() == 0:
+            #             print("[ERROR] car_skip_scale has zero elements; check car_depth and CAR initialization.")
+            #             raise RuntimeError("car_skip_scale is empty")
+            #         if car_skip.device != loss.device:
+            #             print(f"[WARNING] car_skip_scale device {car_skip.device} differs from loss device {loss.device}")
+            #         car_skip_mean = torch.mean(car_skip)
+            #         car_skip_std = torch.std(car_skip)
+            #         car_skip_min = torch.min(car_skip)
+            #         car_skip_max = torch.max(car_skip)
+            #         print(f"[DEBUG] car_skip_scale stats -> min: {car_skip_min.item()}, max: {car_skip_max.item()}, mean: {car_skip_mean.item()}, std: {car_skip_std.item()}")
+            #         reg_term = car_skip.pow(2).mean()
+            #         if not torch.isfinite(reg_term):
+            #             print("[ERROR] car_scale_reg term is non-finite")
+            #             print(f"[DEBUG] reg_term: {reg_term.item()}")
+            #             raise RuntimeError("car_scale_reg produced non-finite value")
+            #         loss_before_reg = loss
+            #         loss = loss + args.car_scale_reg * reg_term
+            #         if not torch.isfinite(loss):
+            #             print("[ERROR] Loss became non-finite after adding car_scale_reg term")
+            #             print(f"[DEBUG] loss_before_reg: {loss_before_reg.item()}, reg_term: {reg_term.item()}, car_scale_reg: {args.car_scale_reg}")
+            #             raise RuntimeError("Final loss is not finite after adding car_scale_reg")
+
         # [backward]
         grad_norm_t, scale_log2_t = self.gpt_opt.backward_clip_step(ep=ep, it=it, g_it=g_it, stepping=stepping, logging_params=logging_params, loss=loss, clip_decay_ratio=clip_decay_ratio, stable=args.stable)
         
         # Update parameter visualizer
-        if self.param_visualizer is not None and stepping:
+        if self.param_visualizer is not None and stepping and False:
             self.param_visualizer.update(g_it)
-            
-            # Generate visualization every 10 steps or at specific milestones
-            if g_it % 10 == 0 or it < 5:
+
+            # Generate visualization every 100 steps or at specific milestones
+            if False and (g_it % 100 == 0 or it < 5):
                 try:
                     self.param_visualizer.plot_module_heatmap(g_it)
                     if it < 3:  # Generate architecture diagram for first few iterations
@@ -548,12 +664,13 @@ class InfinityPilotTrainer(object):
                     print(f"⚠️ Visualization error at iteration {g_it}: {e}")
         
         # Debug parameter freeze status for first few iterations
-        if it % 100 == 0 and ep == 0 and dist.is_master():
-            self._debug_parameter_freeze_status(it)
+        if it % 20 == 0 and dist.is_master():
+        # if False: 
+            # self._debug_parameter_freeze_status(it)
             # [visualize] the result in wandb
             self.generate_training_visualization(
                 ep, it, g_it, 
-                inp_B3HW, condition_B3HW, 
+                inp_B3HW, condition_inputs, 
                 gt_ms_idx_Bl, text_cond_tuple, 
                 scale_schedule, training_scales, training_seq_len
             )
@@ -580,7 +697,7 @@ class InfinityPilotTrainer(object):
 
         # [zero_grad]
         if stepping:
-            if self.using_ema: self.ema_update(g_it)
+            if self.using_ema: pass # self.ema_update(g_it)
             if self.dbg_unused:
                 ls = []
                 for n, p in self.gpt_wo_ddp.named_parameters():
@@ -635,7 +752,7 @@ class InfinityPilotTrainer(object):
                 wandb_log_dict[f'Detail/Acc_token_s{si+1:02d}'] = acc_token_si
             
             # Add parameter monitoring to WandB
-            if stepping and self.param_visualizer is not None:
+            if stepping and self.param_visualizer is not None and False:
                 try:
                     # Get current parameter changes for WandB logging
                     module_changes = defaultdict(list)
@@ -673,7 +790,8 @@ class InfinityPilotTrainer(object):
                 except Exception as e:
                     print(f"⚠️ WandB parameter logging error: {e}")
             
-            wandb_utils.log(wandb_log_dict, step=g_it)
+            # wandb_utils.log(wandb_log_dict, step=g_it)
+            wandb_utils.log(wandb_log_dict)
         
         return grad_norm_t, scale_log2_t
     
@@ -1060,7 +1178,7 @@ class InfinityPilotTrainer(object):
             raise RuntimeError(f"Infinity parameters have gradients! Count: {has_grad_infinity}")
 
     def generate_training_visualization(self, ep: int, it: int, g_it: int, 
-                                    inp_B3HW: torch.Tensor, condition_B3HW: Optional[torch.Tensor], 
+                                    inp_B3HW: torch.Tensor, condition_inputs: Optional[Dict[str, torch.Tensor]], 
                                     gt_ms_idx_Bl: List[torch.Tensor], text_cond_tuple: Tuple[torch.Tensor, torch.Tensor], 
                                     scale_schedule: List[Tuple[int, int, int]], training_scales: int, training_seq_len: int):
         """Generate training visualization using current step results"""
@@ -1071,7 +1189,7 @@ class InfinityPilotTrainer(object):
         try:
             return _generate_training_visualization(
                 self, ep, it, g_it, 
-                inp_B3HW, condition_B3HW, 
+                inp_B3HW, condition_inputs, 
                 gt_ms_idx_Bl, text_cond_tuple, 
                 scale_schedule, training_scales, training_seq_len
             )

@@ -16,7 +16,7 @@ torch.cuda.set_device(0)
 DEFAULT_MODEL_PATH = './weights/mm_2b.pth'
 DEFAULT_VAE_PATH = './weights/infinity_vae_d32_reg.pth'
 DEFAULT_TEXT_ENCODER_CKPT = "./weights/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001"
-DEFAULT_MASK_PATH = 'walmart.jpg'
+DEFAULT_MASK_PATH = 'image.png'
 
 # Default strength values
 DEFAULT_STRENGTH = [0.35, 0.94, 0.97, 0.98, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
@@ -198,7 +198,7 @@ A yellow streetlight, mounted above the signs, casts a warm glow in the overcast
                 # Function to update the displayed image and prompt
                 def update_display(choice):
                     if choice == "Walmart Storefront":
-                        return ["walmart.jpg"], walmart_prompt
+                        return ["image.png"], walmart_prompt
                     else:
                         return ["wall_street.jpg"], wall_street_prompt
                 

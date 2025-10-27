@@ -148,19 +148,6 @@ def build_vae_gpt_pilot(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force
     )
     if skip_gpt:
         return vae_local, None, None
-    
-    if hasattr(args, 'customized_flash_attn'):
-        gpt_kw['customized_flash_attn'] = args.customized_flash_attn
-    if hasattr(args, 'fused_mlp'):
-        gpt_kw['fused_mlp'] = args.fused_mlp
-    if hasattr(args, 'fused_norm'):
-        gpt_kw['fused_norm'] = args.fused_norm
-    if hasattr(args, 'use_flex_attn'):
-        gpt_kw['use_flex_attn'] = args.use_flex_attn
-    if hasattr(args, 'pad_to_multiplier'):
-        gpt_kw['pad_to_multiplier'] = args.pad_to_multiplier
-    if hasattr(args, 'batch_size'):
-        gpt_kw['batch_size'] = args.batch_size
         
     # For pilot training, we need to use the correct model dimensions
     model_str = getattr(args, 'gpt', args.model).replace('-', '_')

@@ -2,20 +2,20 @@ import torch
 import numpy as np
 import cv2
 import traceback
-from typing import Optional, List
+from typing import Optional, List, Dict
 from infinity.utils import arg_util, misc, wandb_utils
 
 
 @torch.no_grad()
 def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int, 
-                                   inp_B3HW: torch.Tensor, condition_B3HW: Optional[torch.Tensor], 
+                                   inp_B3HW: torch.Tensor, condition_inputs: Optional[Dict[str, torch.Tensor]], 
                                    gt_ms_idx_Bl: List[torch.Tensor], text_cond_tuple, 
                                    scale_schedule, training_scales: int, training_seq_len: int):
     """Generate visualization images during training using current training step results and log to wandb"""
     try:
         # Only generate visualizations occasionally to avoid overhead
-        if g_it % 2000 != 0 and it != 0:  # Every 1000 global iterations or first iteration
-            return
+        # if g_it % 100 == 0 and it != 0:  # Every 100 global iterations or first iteration
+            # return
             
         # # print(f"Generating training visualization at epoch {ep}, iteration {it}, global_it {g_it}...")
         
@@ -25,7 +25,12 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
         # Limit to first 2 samples to avoid memory issues
         vis_batch_size = min(2, inp_B3HW.shape[0])
         inp_vis = inp_B3HW[:vis_batch_size]
-        condition_vis = condition_B3HW[:vis_batch_size] if condition_B3HW is not None else None
+        if condition_inputs is not None:
+            condition_vis = {k: v[:vis_batch_size] for k, v in condition_inputs.items() if v is not None}
+            if len(condition_vis) == 0:
+                condition_vis = None
+        else:
+            condition_vis = None
         
         # Use current training step's ground truth tokens to reconstruct images
         reconstruction_images = []
@@ -34,7 +39,9 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
             try:
                 # Get single sample
                 single_inp = inp_vis[i:i+1]  # [1, 3, H, W] - original input
-                single_condition = condition_vis[i:i+1] if condition_vis is not None else None
+                single_condition = None
+                if condition_vis is not None:
+                    single_condition = {k: v[i:i+1] for k, v in condition_vis.items()}
                 
                 # Get ground truth tokens for this sample
                 single_gt_tokens = [gt_tokens[i:i+1] for gt_tokens in gt_ms_idx_Bl]
@@ -149,13 +156,18 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
                 comparison_images = []
                 
                 # Original input image (normalize from [-1,1] to [0,1] and ensure on device)
-                orig_display = torch.clamp((single_inp.squeeze(0) + 1) / 2, 0, 1).to(device)
+                orig_display = torch.clamp(single_inp.squeeze(0), -1, 1).to(device)
                 comparison_images.append(orig_display)
                 
                 # Condition image (if exists)
                 if single_condition is not None:
-                    condition_display = torch.clamp((single_condition.squeeze(0) + 1) / 2, 0, 1).to(device)
-                    comparison_images.append(condition_display)
+                    if 'normal' in single_condition:
+                        comparison_images.append(torch.clamp(single_condition['normal'].squeeze(0), -1, 1).to(device))
+                    if 'mask' in single_condition:
+                        mask_img = torch.clamp(single_condition['mask'].squeeze(0), -1, 1).to(device)
+                        if mask_img.shape[0] == 1:
+                            mask_img = mask_img.repeat(3, 1, 1)
+                        comparison_images.append(mask_img)
                 
                 # Ground truth reconstruction (normalize and ensure on device)
                 if isinstance(reconstructed_img, torch.Tensor):
@@ -167,17 +179,15 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
                     
                     # Normalize based on the range of values (參考 infinity_pilot.py line 1129-1130)
                     # img = (img + 1) / 2
-                    if reconstructed_img.min() < 0:  # If in [-1,1] range
-                        recon_display = torch.clamp((reconstructed_img + 1) / 2, 0, 1)
-                    else:  # If in [0,1] or other range
-                        recon_display = torch.clamp(reconstructed_img, 0, 1)
+                    recon_display = torch.clamp(reconstructed_img, -1, 1)
+                        
                 else:
                     # Convert numpy to tensor if needed
-                    recon_display = torch.clamp(
-                        torch.from_numpy(reconstructed_img).permute(2, 0, 1).to(device) / 255.0, 
-                        0, 1
-                    )
-                
+                    recon_display = torch.from_numpy(reconstructed_img).permute(2, 0, 1).to(device)
+                    if recon_display.max() > 1.0:
+                        recon_display = recon_display / 127.5 - 1.0
+                        recon_display = torch.clamp( recon_display, -1, 1)
+
                 comparison_images.append(recon_display)
                 
                 # Ensure all images have the same spatial dimensions
@@ -202,7 +212,9 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
                 
                 # Create a placeholder image if processing fails
                 h, w = inp_vis.shape[-2:]
-                num_images = 3 if condition_vis is not None else 2
+                num_images = 2
+                if condition_vis is not None:
+                    num_images += len(condition_vis)
                 placeholder = torch.zeros(3, h, w * num_images, device=device)
                 reconstruction_images.append(placeholder)
                 continue
@@ -256,7 +268,7 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
                     torch.cuda.empty_cache()
                 except Exception as cleanup_error:
                     print(f"Cleanup error: {cleanup_error}")
-                    
+
     except Exception as e:
         print(f"Error in training visualization: {e}")
         traceback.print_exc()

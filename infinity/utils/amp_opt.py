@@ -119,7 +119,17 @@ class AmpOptimizer:
         self, ep: int, it: int, g_it: int, stepping: bool, logging_params: bool, loss: torch.Tensor, clip_decay_ratio=1, stable=False,
     ) -> Tuple[torch.Tensor, Optional[float]]:
         # backward
+        if not torch.isfinite(loss):
+            print(f"[ERROR] Incoming loss to backward is non-finite: {loss.item() if loss.numel() == 1 else loss}")
+            raise RuntimeError("Non-finite loss before applying accumulation ratio")
+        if not math.isfinite(self.r_accu) or self.r_accu <= 0:
+            print(f"[ERROR] Invalid accumulation ratio self.r_accu={self.r_accu}")
+            raise RuntimeError("Invalid gradient accumulation ratio")
+
         loss = loss.mul(self.r_accu)   # r_accu == 1.0 / n_gradient_accumulation
+        # Debug first steps for diagnosing NaNs
+        if g_it < 50 and dist.is_local_master():
+            print(f"[DEBUG] backward_clip_step g_it={g_it}, ep={ep}, it={it}, raw_loss={loss.item() / self.r_accu}, scaled_loss={loss.item()}, r_accu={self.r_accu}")
         
         # 檢查 loss 是否為 NaN 或 inf
         if not torch.isfinite(loss):

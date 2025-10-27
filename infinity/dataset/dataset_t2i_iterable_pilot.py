@@ -86,7 +86,7 @@ class T2IIterableDataset(IterableDataset):
         self, 
         meta_folder: str, 
         max_caption_len=512, 
-        short_prob=0.2, 
+        short_prob=0.0, 
         load_vae_instead_of_image=False,
         buffersize: int = 10000,
         seed: int = 0, 
@@ -272,11 +272,13 @@ class T2IIterableDataset(IterableDataset):
                     print(e)
             captions = [item[0] for item in batch_data]
             images = torch.stack([item[1] for item in batch_data])
-            condition_images = torch.stack([item[2] for item in batch_data]) # modified
-            yield (images, condition_images, captions) # modified
+            condition_masks = torch.stack([item[2] for item in batch_data])
+            condition_normals = torch.stack([item[3] for item in batch_data])
+            yield (images, condition_masks, condition_normals, captions)
             del batch_data
             del images
-            del condition_images
+            del condition_masks
+            del condition_normals
             del captions
     
     def infinite_next(self, generator_info):
@@ -329,17 +331,18 @@ class T2IIterableDataset(IterableDataset):
 
     def prepare_model_input(self, data_item) -> Tuple:
         img_path, h_div_w = data_item['image_path'], data_item['h_div_w'] # for extra input "image pth 2"
-        # condition_path = data_item.get('normals', img_path) # for extra input "condition image pth 2"
-        condition_path = img_path.replace('images', 'normal_vis') # condition input
-        condition_path = condition_path.replace('jpg', 'png') # condition input 
-        short_text_input, long_text_input = data_item['text'], data_item['long_caption']
+        mask_path = img_path.replace('images', 'normal_mask') # legacy text mask
+        # mask_path = mask_path.replace('jpg', 'png')
+        normal_path = img_path.replace('images', 'normals')
+        # normal_path = data_item.get('normal_map_path', None)
+        long_text_input = data_item['long_caption']
         long_text_type = data_item.get('long_caption_type', 'user_prompt')
-        text_input = self.get_text_input(long_text_input, short_text_input, long_text_type)
+        text_input = self.get_text_input(long_text_input, None, long_text_type)
         text_input = process_short_text(text_input)
 
         h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w - h_div_w_templates))]
         try:
-            if self.load_vae_instead_of_image:
+            if self.load_vae_instead_of_image:      # Set to False
                 img_B3HW = None
                 vae_path = self.get_vae_path(img_path)
                 with open(vae_path, 'rb') as f:
@@ -352,11 +355,14 @@ class T2IIterableDataset(IterableDataset):
                     tgt_h, tgt_w = dynamic_resolution_h_w[np.float64(1.0)][self.pn]['pixel']
                     img_B3HW = transform(img, tgt_h, tgt_w)
                 # 處理條件圖像 modified
-                with open(condition_path, 'rb') as f:
-                    condition_img: PImage.Image = PImage.open(f)
-                    condition_img = condition_img.convert('RGB')
-                    # 使用相同的尺寸
-                    condition_B3HW = transform(condition_img, tgt_h, tgt_w)
+                with open(mask_path, 'rb') as f:
+                    mask_img: PImage.Image = PImage.open(f)
+                    mask_img = mask_img.convert('RGB')
+                    condition_mask_B3HW = transform(mask_img, tgt_h, tgt_w)
+                with open(normal_path, 'rb') as f:
+                    normal_img: PImage.Image = PImage.open(f)
+                    normal_img = normal_img.convert('RGB')
+                    condition_normal_B3HW = transform(normal_img, tgt_h, tgt_w)
             if not self.online_t5:
                 short_t5_path, long_t5_path = self.get_t5_path(img_path)
                 if self.epoch_global_worker_generator.random() <= self.short_prob:
@@ -369,26 +375,26 @@ class T2IIterableDataset(IterableDataset):
             print(f'input error: {e}, skip to another index')
             return False, None
 
-        if self.load_vae_instead_of_image:
+        if self.load_vae_instead_of_image:      # Set to False
             return True, (text_input, *gt_ms_idx_Bl)
         else:
-            return True, (text_input, img_B3HW, condition_B3HW)
+            return True, (text_input, img_B3HW, condition_mask_B3HW, condition_normal_B3HW)
 
     @staticmethod
     def collate_function(batch, online_t5: bool = False) -> None:
         pass
 
 if __name__ == '__main__':
-    # torchrun --nnodes=1 --nproc-per-node=2 --master_addr=$METIS_WORKER_0_HOST --master_port=$METIS_WORKER_0_PORT dataset/dataset_t2i_iterable.py
+    # torchrun --nnodes=1 --nproc-per-node=2 --master_addr=$METIS_WORKER_0_HOST --master_port=$METIS_WORKER_0_PORT dataset/dataset_t2i_iterable_pilot.py
     tdist.init_process_group(backend='nccl')
     batch_size = 2
     dataloader_workers = 12
     dataset = T2IIterableDataset(
         args=None, 
-        meta_folder='data/train_splits/xxx_pretrain/jsonl_files_filter_duplicate_captions',
+        meta_folder='/mnt/syndata/toy_data',
         data_load_reso=None, 
         max_caption_len=512, 
-        short_prob=1.0, 
+        short_prob=0.0, 
         load_vae_instead_of_image=False,
         buffersize=100000,
         seed=0, 

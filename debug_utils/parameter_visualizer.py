@@ -32,13 +32,14 @@ class ParameterChangeVisualizer:
         # 定義模組分組
         self.module_groups = {
             'Infinity_Embedding': ['word_embed', 'pos_start', 'pos_1LC', 'lvl_embed'],
-            'Infinity_Blocks': ['blocks'],
-            'Infinity_Output': ['head_nm', 'head'],
             'CAR_Control': ['car_control_convs'],
             'CAR_VAR': ['car_var_conv'],
             'CAR_Blocks': ['car_blocks'],
             'CAR_Skip': ['car_skip_norm', 'car_skip_linear'],
-            'CAR_Others': ['car_']
+            'CAR_Others': ['car_'],
+            'Infinity_Blocks': ['blocks'],
+            'Infinity_Input': ['head_nm', 'head'],
+            
         }
         
         # 創建顏色映射
@@ -52,15 +53,15 @@ class ParameterChangeVisualizer:
         """捕獲初始參數狀態 - 包含所有参数，不管是否可训练"""
         for name, param in self.model.named_parameters():
             self.initial_params[name] = param.data.clone().detach()
+
     
     def _get_param_change_magnitude(self, name: str, current_param: torch.Tensor) -> float:
         """計算參數變化幅度"""
         if name not in self.initial_params:
             return 0.0
         
-        initial = self.initial_params[name]
-        change = torch.norm(current_param - initial).item()
-        param_norm = torch.norm(initial).item()
+        change = torch.norm(current_param - self.initial_params[name]).item()
+        param_norm = torch.norm(self.initial_params[name]).item()
         
         # 相對變化率
         if param_norm > 1e-8:
@@ -100,6 +101,11 @@ class ParameterChangeVisualizer:
         self.param_history[iteration] = current_changes
         self.gradient_history[iteration] = current_grads
         self.iteration_count += 1
+
+        # 清理中間變量以節省內存
+        del current_changes
+        del current_grads
+        torch.cuda.empty_cache()
     
     def plot_module_heatmap(self, iteration: int = None, figsize=(15, 10)):
         """繪製模組級別的參數變化熱度圖"""
@@ -203,90 +209,16 @@ class ParameterChangeVisualizer:
         ax4.set_ylim(0, 1.2)
         
         plt.tight_layout()
-        plt.savefig(f'{self.save_dir}/module_analysis_iter_{iteration}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'{self.save_dir}/module_analysis_iter.png', dpi=300, bbox_inches='tight')
         # plt.show()
-        
-    def print_parameter_analysis(self, iteration: int = None):
-        """打印詳細的參數分析"""
-        if iteration is None:
-            iteration = max(self.param_history.keys()) if self.param_history else 0
-        
-        if iteration not in self.param_history:
-            print(f"No data for iteration {iteration}")
-            return
-        
-        # 按模組聚合數據 - 包含所有参数，不只是 requires_grad=True 的
-        module_changes = defaultdict(list)
-        module_grads = defaultdict(list)
-        module_requires_grad = defaultdict(list)
-        
-        # 遍历所有参数，不管是否 requires_grad
-        for name, param in self.model.named_parameters():
-            module = self._categorize_parameter(name)
-            
-            # 只有可训练参数才有变化记录
-            if param.requires_grad and name in self.param_history[iteration]:
-                change = self.param_history[iteration][name]
-                module_changes[module].append(change)
-                
-                if name in self.gradient_history[iteration]:
-                    module_grads[module].append(self.gradient_history[iteration][name])
-            else:
-                # 冻结参数的变化为0
-                module_changes[module].append(0.0)
-                module_grads[module].append(0.0)
-            
-            # 记录参数的 requires_grad 状态
-            module_requires_grad[module].append(param.requires_grad)
-        
-        # 計算模組級別的統計
-        module_stats = {}
-        for module in module_changes:
-            changes = module_changes[module]
-            grads = module_grads[module]
-            requires_grad_list = module_requires_grad[module]
-            
-            # 判断模块状态：如果所有参数都是frozen，则为frozen
-            all_frozen = not any(requires_grad_list)
-            any_trainable = any(requires_grad_list)
-            
-            module_stats[module] = {
-                'param_change_mean': np.mean(changes) if changes else 0,
-                'param_change_max': np.max(changes) if changes else 0,
-                'grad_mean': np.mean(grads) if grads else 0,
-                'grad_max': np.max(grads) if grads else 0,
-                'param_count': len(changes),
-                'frozen_status': all_frozen,
-                'mixed_status': any_trainable and not all(requires_grad_list)  # 部分冻结
-            }
-        
-        # 獲取所有模組並排序
-        modules = sorted(module_stats.keys())
-        
-        # 打印詳細信息
-        print(f"\n=== Parameter Analysis at Iteration {iteration} ===")
-        for module in modules:
-            stats = module_stats[module]
-            if stats['frozen_status']:
-                status = "🟢 FROZEN"
-            elif stats['mixed_status']:
-                status = "🟡 MIXED"
-            else:
-                status = "🔴 TRAINING"
-            
-            print(f"{module:20s} | {status} | Params: {stats['param_count']:4d} | "
-                  f"Change: {stats['param_change_mean']:.2e} | Grad: {stats['grad_mean']:.2e}")
-        
-        # 如果发现应该冻结的模块在训练，打印详细信息
-        infinity_modules = ['Infinity_Embedding', 'Infinity_Blocks', 'Infinity_Output']
-        for module in infinity_modules:
-            if module in module_stats and not module_stats[module]['frozen_status']:
-                print(f"\n[WARNING] {module} should be frozen but shows training status!")
-                # 打印该模块中可训练的参数
-                for name, param in self.model.named_parameters():
-                    if self._categorize_parameter(name) == module and param.requires_grad:
-                        print(f"  - Trainable: {name}")
-    
+
+                # 清理中間變量以節省內存
+        del module_changes
+        del module_grads
+        del module_requires_grad
+        del module_stats
+        torch.cuda.empty_cache()
+
     def plot_architecture_diagram(self, iteration: int = None):
         """繪製架構圖與參數變化"""
         if iteration is None:

@@ -1,4 +1,4 @@
-# train_pilot_ori.py
+# train_pilot.py
 import gc
 import json
 import math
@@ -111,7 +111,8 @@ def build_everything_from_args(args: arg_util.Args, saver):
         vae_ckpt = torch.load(args.vae_ckpt, map_location='cpu')
 
     # build models. Note that here gpt is the causal VAR transformer which performs next scale prediciton with text guidance
-    text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim = build_model_optimizer_nonused(args, vae_ckpt)
+    text_tokenizer, text_encoder, vae_local, None,              infinity_wo_ddp,        None,       None,           None,           gpt_optim = build_model_optimizer_pilot(args, vae_ckpt)
+    # text_tokenizer, text_encoder, vae_local, gpt_uncompiled,    gpt_wo_ddp,             gpt_ddp,    gpt_wo_ddp_ema, gpt_ddp_ema,    gpt_optim = build_model_optimizer_pilot(args, vae_ckpt)
     
     # IMPORTANT: import heavy package `InfinityPilotTrainer` after the Dataloader object creation/iteration to avoid OOM
     from trainer_pilot import InfinityPilotTrainer
@@ -263,70 +264,69 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         num_heads=num_heads,
         mlp_ratio=4.0,  # Standard value
     )
-    # Get the kwargs for InfinityPilot creation
-    gpt_kw = dict(
-        # missing params
-        # pretrained=False, global_pool='',
-        vae_local=vae_local,
-        text_channels=args.Ct5,
-        text_maxlen=args.tlen,
-        embed_dim=embed_dim,
-        depth=depth,
-        num_heads=num_heads,
-        mlp_ratio=4.0,              # Standard value 
-        drop_path_rate=getattr(args, 'dp', 0.0) if hasattr(args, 'dp') and args.dp >= 0 else 0.0,
-        norm_eps=getattr(args, 'norm_eps', 1e-6),
-        cond_drop_rate=args.cfg, 
-        rand_uncond=args.rand_uncond, 
-        drop_rate=args.drop,
-        raw_scale_schedule=args.scale_schedule,
-        add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
-        use_bit_label=args.use_bit_label, 
-        rope2d_each_sa_layer=args.rope2d_each_sa_layer, 
-        rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
-        pn=args.pn, 
-        train_h_div_w_list=getattr(args, 'train_h_div_w_list', None), 
-        video_frames=getattr(args, 'video_frames', 1),
-        always_training_scales=args.always_training_scales,
-        apply_spatial_patchify=args.apply_spatial_patchify,
-        inference_mode=getattr(args, 'inference_mode', False),
-        # Additional args-based parameters
-        shared_aln=getattr(args, 'saln', False),
-        head_aln=getattr(args, 'haln', True),
-        cross_attn_layer_scale=getattr(args, 'ca_gamma', -1.0),
-        nm0=getattr(args, 'nm0', False),
-        tau=getattr(args, 'tau', 1),
-        cos_attn=getattr(args, 'cos', True),
-        swiglu=getattr(args, 'swi', False),
-        head_depth=getattr(args, 'dec', 1),
-        top_p=getattr(args, 'tp', 0.0),
-        top_k=getattr(args, 'tk', 0.0),
-        rms_norm=getattr(args, 'rms', False),
-        customized_flash_attn=getattr(args, 'customized_flash_attn', False),
-        fused_mlp=getattr(args, 'fused_mlp', False),
-        fused_norm=getattr(args, 'fused_norm', False),
-        checkpointing=getattr(args, 'enable_checkpointing', False),     # added
-        pad_to_multiplier=getattr(args, 'pad_to_multiplier', 1),       # added
-        use_flex_attn=args.use_flex_attn,                   # added 
-        batch_size=getattr(args, 'batch_size', 4),          # added
-        car_depth=getattr(args, 'car_depth', 16),          # added
-        save_car_separately=getattr(args, 'save_car_separately', True),  # added
-        car_condition_channels=getattr(args, 'car_condition_channels', 3),
 
-    )
+    # Get the kwargs for InfinityPilot creation
+    # gpt_kw = dict(
+    #     vae_local=vae_local, 
+    #     text_channels=args.Ct5, 
+    #     text_maxlen=args.tlen,
+    #     embed_dim=embed_dim,
+    #     depth=depth,
+    #     num_heads=num_heads,
+    #     mlp_ratio=4.0,  # Standard value
+    #     drop_path_rate=getattr(args, 'dp', 0.0) if hasattr(args, 'dp') and args.dp >= 0 else 0.0,
+    #     norm_eps=getattr(args, 'norm_eps', 1e-6),
+    #     cond_drop_rate=args.cfg, 
+    #     rand_uncond=args.rand_uncond, 
+    #     drop_rate=args.drop,
+    #     raw_scale_schedule=args.scale_schedule,
+    #     add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
+    #     use_bit_label=args.use_bit_label, 
+    #     rope2d_each_sa_layer=args.rope2d_each_sa_layer, 
+    #     rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
+    #     pn=args.pn, 
+    #     train_h_div_w_list=getattr(args, 'train_h_div_w_list', None), 
+    #     video_frames=getattr(args, 'video_frames', 1),
+    #     always_training_scales=args.always_training_scales, 
+    #     apply_spatial_patchify=args.apply_spatial_patchify, 
+    #     inference_mode=getattr(args, 'inference_mode', False),
+    #     # Additional args-based parameters
+    #     shared_aln=getattr(args, 'saln', False),
+    #     head_aln=getattr(args, 'haln', True),
+    #     cross_attn_layer_scale=getattr(args, 'ca_gamma', -1.0),
+    #     nm0=getattr(args, 'nm0', False),
+    #     tau=getattr(args, 'tau', 1),
+    #     cos_attn=getattr(args, 'cos', True),
+    #     swiglu=getattr(args, 'swi', False),
+    #     head_depth=getattr(args, 'dec', 1),
+    #     top_p=getattr(args, 'tp', 0.0),
+    #     top_k=getattr(args, 'tk', 0.0),
+    #     rms_norm=getattr(args, 'rms', False),
+    # )
     
     # # Add optional parameters if they exist
-    if getattr(args, 'num_block_chunks', 1) > 1:
-        gpt_kw['block_chunks'] = args.num_block_chunks
-    else:
-        gpt_kw['block_chunks'] = 1
-    
+    # if hasattr(args, 'customized_flash_attn'):
+    #     gpt_kw['customized_flash_attn'] = args.customized_flash_attn
+    # if hasattr(args, 'fused_mlp'):
+    #     gpt_kw['fused_mlp'] = args.fused_mlp
+    # if hasattr(args, 'fused_norm'):
+    #     gpt_kw['fused_norm'] = args.fused_norm
+    # if hasattr(args, 'use_flex_attn'):
+    #     gpt_kw['use_flex_attn'] = args.use_flex_attn
+    # if hasattr(args, 'pad_to_multiplier'):
+    #     gpt_kw['pad_to_multiplier'] = args.pad_to_multiplier
+    # if hasattr(args, 'batch_size'):
+    #     gpt_kw['batch_size'] = args.batch_size
+    # if getattr(args, 'num_block_chunks', 1) > 1:
+    #     gpt_kw['block_chunks'] = args.num_block_chunks
+    # else:
+    #     gpt_kw['block_chunks'] = 1
     
     # Create InfinityPilot with memory optimization
     # Step 1: Create model without loading weights first
     gpt_wo_ddp = InfinityPilot(
         infinity_base_model=None,  # Don't load weights yet
-        init_car_modules=False,    # Don't init CAR yet
+        init_car_modules=True,    # Don't init CAR yet
         freeze_infinity=True,     # Freeze infinity
         **gpt_kw
     )
@@ -345,7 +345,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     # Debug console: {(name, p.grad.shape) for name, p in gpt_wo_ddp.named_parameters() if p.grad is not None}
 
     # verify freeze state
-    # debug_parameter_freeze_status(gpt_wo_ddp)
+    debug_parameter_freeze_status(gpt_wo_ddp)
     
     # Memory monitoring after model creation
     if torch.cuda.is_available():
@@ -355,19 +355,17 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     if args.tini < 0:
         args.tini = math.sqrt(1 / gpt_wo_ddp.C / 3)
     
-    gpt_kw['car_resume_path'] = getattr(args, 'car_resume_path', None)
-    gpt_kw['special_car_init'] = getattr(args, 'special_car_init', None)
-    if gpt_kw['car_resume_path'] is not None and gpt_kw['car_resume_path'] != '' and gpt_kw['car_resume_path'].lower() != 'none':
-        print(f"Resuming CAR weights from: {gpt_kw['car_resume_path']}")
-        car_ckpt = torch.load(gpt_kw['car_resume_path'], map_location='cpu')
-        gpt_wo_ddp.load_car_weights(car_ckpt)
-        del car_ckpt
-        torch.cuda.empty_cache()
-    else:
-        # Use default CAR initialization (simple Xavier)
-        print("Initializing CAR modules with default Xavier initialization")
-        gpt_wo_ddp.special_car_init(gpt_kw)
-        print("InfinityPilot initialized with automatic checkpoint loading and CAR modules trainable")
+    # Only initialize CAR modules, Infinity part is already loaded
+    car_params = gpt_wo_ddp.get_car_parameters()
+    for param in car_params:
+        if param.ndim >= 2:  
+            # for matrices in Linear and Conv layers
+            torch.nn.init.xavier_uniform_(param, gain=args.tini)
+        else:  
+            # for biases and LayerNorm/GroupNorm weights
+            torch.nn.init.zeros_(param)
+    
+    print("InfinityPilot initialized with automatic checkpoint loading and CAR modules trainable")
     
     # Update word embedding settings if needed
     if args.rwe:
@@ -473,16 +471,9 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     # 創建一個只包含可訓練參數的模型包裝器，以避免 filter_params 中的 names_no_grad 斷言錯誤
     class TrainableParametersWrapper:
         """只包含可訓練參數的模型包裝器"""
-        def __init__(self, model, prefixes_to_ignore: Optional[List[str]] = ['car_', 'control_']):
+        def __init__(self, model):
             self.model = model
-            self.prefixes_to_ignore = prefixes_to_ignore if prefixes_to_ignore is not None else []
-            # self._trainable_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
-            self._trainable_params = []
-            for name, param in model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if any(pfx in  name for pfx in self.prefixes_to_ignore):
-                    self._trainable_params.append((name, param))
+            self._trainable_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
             
         def named_parameters(self):
             return self._trainable_params
@@ -492,8 +483,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
             return getattr(self.model, name)
     
     # 使用包裝器來只處理可訓練的參數
-    trainable_model_wrapper = TrainableParametersWrapper(gpt_ddp if args.zero else gpt_wo_ddp,
-                                                         prefixes_to_ignore=['car_', 'control_'])
+    trainable_model_wrapper = TrainableParametersWrapper(gpt_ddp if args.zero else gpt_wo_ddp)
     
     nowd_keys = set()
     _temp_ = args.nowd 
@@ -501,8 +491,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         # 只包含實際存在於可訓練參數中的 no weight decay 參數
         nowd_keys |= {
             # CAR 相關的參數
-            'car_control_convs', 'car_var_conv',
-             'car_skip_norm', 'car_skip_linear',
+            'car_control_convs', 'car_var_conv', 'car_skip_norm', 'car_skip_linear',
             # 一些通用的參數（如果它們在 CAR 模塊中）
             'gamma', 'beta', 'bias',
         }
@@ -525,16 +514,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     opt_kw = dict(lr=args.tlr, weight_decay=0)
     if args.oeps: opt_kw['eps'] = args.oeps
     print(f'[vgpt] optim={opt_clz}, opt_kw={opt_kw}\n')
-    for group in para_groups:
-        group['lr_sc'] = group.get('lr_sc', 1.0) * args.car_lr_scale
-
-    gpt_optim = AmpOptimizer('gpt',
-                              args.fp16,
-                              opt_clz(params=para_groups, **opt_kw), 
-                              gpt_ddp if args.zero else gpt_wo_ddp, 
-                              args.r_accu, 
-                              args.tclip, 
-                              args.zero)
+    gpt_optim = AmpOptimizer('gpt', args.fp16, opt_clz(params=para_groups, **opt_kw), gpt_ddp if args.zero else gpt_wo_ddp, args.r_accu, args.tclip, args.zero)
     del names, paras, para_groups
     
     if args.online_t5:
@@ -816,16 +796,11 @@ def train_one_ep(
             
             with maybe_record_function('before_train'):
                 # [get data] - Handle pilot data format with condition
-                condition_inputs = {}
-                if len(data) == 4:
-                    inp, condition_mask, condition_normal, captions = data
-                elif len(data) == 3:
-                    inp, condition_normal, captions = data
-                    condition_mask = None
+                if len(data) == 3:
+                    inp, condition, captions = data
                 else:
                     inp, captions = data
-                    condition_mask = None
-                    condition_normal = None
+                    condition = None
                 tokens = text_tokenizer(text=captions, max_length=text_tokenizer.model_max_length, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
                 input_ids = tokens.input_ids.cuda(non_blocking=True)
                 mask = tokens.attention_mask.cuda(non_blocking=True)
@@ -841,17 +816,8 @@ def train_one_ep(
                 kv_compact = torch.cat(kv_compact, dim=0)
                 text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = (kv_compact, lens, cu_seqlens_k, Ltext)
                 inp = inp.to(args.device, non_blocking=True)
-                if condition_normal is not None:
-                    condition_normal = condition_normal.to(args.device, non_blocking=True)
-                    condition_inputs['normal'] = condition_normal
-            if condition_mask is not None:
-                condition_mask = condition_mask.to(args.device, non_blocking=True)
-                if args.car_mask_drop_prob > 0 and random.random() < args.car_mask_drop_prob:
-                    condition_mask = None
-                if condition_mask is not None:
-                    condition_inputs['mask'] = condition_mask
-                if not condition_inputs:
-                    condition_inputs = None
+                if condition is not None:
+                    condition = condition.to(args.device, non_blocking=True)
                 # if it > start_it + 10:
                 #     telling_dont_kill.early_stop()
                 
@@ -864,7 +830,7 @@ def train_one_ep(
                     last_touch = time.time()
 
                 # [schedule learning rate]
-                wp_it = max(int(args.wp * iters_train), args.min_warmup_iters)
+                wp_it = args.wp * iters_train
                 min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(args.sche, trainer.gpt_opt.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe)
                 
                 # 檢查學習率是否異常
@@ -901,7 +867,7 @@ def train_one_ep(
                     metric_lg=me, 
                     logging_params=stepping and step_cnt == 1 and (ep < 4 or ep in logging_params_milestone), 
                     inp_B3HW=inp, 
-                    condition_inputs=condition_inputs,
+                    condition_B3HW=condition,  # This is the key difference for pilot
                     text_cond_tuple=text_cond_tuple,
                     args=args,
                 )

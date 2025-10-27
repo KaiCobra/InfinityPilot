@@ -24,11 +24,12 @@ class Args(Tap):
     ds: str = 'oi'                      # only used in GPT training::load_viz_data & FID benchmark
     model: str = ''                     # for VAE training, 'b' or any other for GPT training
     short_cap_prob: float = 0.2         # prob for training with short captions
-    project_name: str = 'TextVAR'       # name of wandb project
+    project_name: str = 'InfinityPilot' # name of wandb project
     tf32: bool = True                   # whether to use TensorFloat32
     auto_resume: bool = True            # whether to automatically resume from the last checkpoint found in args.bed
     rush_resume: str = ''               # pretrained infinity checkpoint
     car_resume_path: str = ''           # pretrained CAR checkpoint (for InfinityPilot)
+    special_car_init:str = ''           # special init method for CAR w/o pretrained weight: ['subset', 'interp', 'merge']
     save_car_epoch_freq: int = 1        # 每多少個 epoch 保存一次 CAR 權重
     save_car_separately: bool = True    # 是否分別保存 CAR 權重
     nowd: int = 1                       # whether to disable weight decay on sparse params (like class token)
@@ -75,6 +76,11 @@ class Args(Tap):
     ca_gamma: float = -1                # >=0 for using layer-scale for cross attention
     diva: int = 1                       # rescale_attn_fc_weights
     hd0: float = 0.02                   # head.w *= hd0
+    car_lr_scale: float = 0.5           # learning-rate multiplier applied to CAR params
+    car_scale_reg: float = 5e-03        # L2 regularization weight for car_skip_scale
+    min_warmup_iters: int = 2048        # minimum warmup iterations (in steps)
+    car_condition_channels: int = 6     # number of channels for CAR condition input (normal map + mask)
+    car_mask_drop_prob: float = 0.1     # prob of dropping mask input (use normal map only)
     dec: int = 1                        # dec depth
     cum: int = 3                        # cumulating fea map as GPT TF input, 0: not cum; 1: cum @ next hw, 2: cum @ final hw
     rwe: bool = False                   # random word emb
@@ -250,7 +256,7 @@ class Args(Tap):
     debug:bool = False              # Selection of Debug mode: [True, False]
     sync_tensorboard:bool = False   # sync to tensorboard (model structure) [True, False]
     # Ablasion studies
-    car_depth = 4
+    car_depth:int = 4
 
 
 
