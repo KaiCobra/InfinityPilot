@@ -140,18 +140,11 @@ def gen_one_img_pilot(
         negative_label_B_or_BLT = None
     
     # 準備控制圖像（如果提供）
-    control_tensors = None
+    control_tokens = None
     if control_path:
-        print(f'Loading control image from: {control_path}')
-        control_tensors = []
-        for i, (pt, ph, pw) in enumerate(scale_schedule):
-            target_h, target_w = ph * 16, pw * 16  # 假設 patch size 為 16
-            control_tensor = prepare_control_image(control_path, target_h, target_w)
-            if control_tensor is not None:
-                control_tensors.append(control_tensor.cuda())
-        if not control_tensors:
-            control_tensors = None
-    
+        print(f"[warn] control_path provided ({control_path}) but automatic conversion to control tokens is not implemented in this script yet.")
+        print("       Proceeding without control by default.")
+
     print(f'cfg: {cfg_list}, tau: {tau_list}')
     
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
@@ -185,7 +178,7 @@ def gen_one_img_pilot(
             gt_ls_Bl=gt_ls_Bl, 
             inference_mode=True,
             sampling_per_bits=sampling_per_bits,
-            control_tensors=control_tensors,  # 添加控制張量
+            control_tokens=control_tokens,
         )
     
     print(f"cost: {time.time() - sstt}, infinity_pilot cost={time.time() - stt}")

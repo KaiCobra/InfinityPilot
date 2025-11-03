@@ -100,8 +100,7 @@ FREEZE_CONFIG = {
     
     # 需要訓練的 CAR 模塊
     'trainable_modules': [
-        'car_control_convs', 'car_var_conv', 'car_blocks', 
-        'car_skip_norm', 'car_skip_linear'
+        'car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates'
     ]
 }
 

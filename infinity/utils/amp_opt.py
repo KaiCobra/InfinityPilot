@@ -6,6 +6,7 @@ import time
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 # from memory_profiler import profile
 
@@ -144,7 +145,7 @@ class AmpOptimizer:
         if self.scaler is not None:
             self.scaler.scale(loss).backward(retain_graph=False, create_graph=False)  # retain_graph=retain_graph, create_graph=create_graph
         else:
-            with torch.autograd.detect_anomaly():
+            # with torch.autograd.detect_anomaly():
                 # 在反向傳播前檢查模型參數
                 nan_params = []
                 inf_params = []
@@ -168,41 +169,72 @@ class AmpOptimizer:
                     print(f"[DEBUG] Loss requires_grad: {loss.requires_grad}")
                     
                     # Auto-fix: Check for problematic parameters and re-initialize them
-                    if "GeluBackward0" in str(e) or "nan values" in str(e):
-                        print("[FIX] Detected GELU backward NaN issue - attempting parameter fix...")
+                    if "LayerNorm" in str(e) or "nan values" in str(e):
+                        print("[FIX] Detected LayerNorm/NaN backward issue - attempting comprehensive fix...")
                         
-                        # Fix parameters that might cause GELU issues
+                        # Fix LayerNorm modules specifically
                         fixed_count = 0
+                        problem_layers = []
+                        
+                        for name, module in self.model_maybe_fsdp.named_modules():
+                            if isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
+                                # Fix epsilon if too small
+                                if hasattr(module, 'eps') and module.eps < 1e-5:
+                                    print(f"  ⚠️  {name}: eps={module.eps} too small, increasing to 1e-5")
+                                    module.eps = 1e-5
+                                    fixed_count += 1
+                                
+                                # Fix weight/bias
+                                if hasattr(module, 'weight') and module.weight is not None:
+                                    w = module.weight.data
+                                    if torch.isnan(w).any() or torch.isinf(w).any():
+                                        print(f"  🔧 {name}: reinit weight (NaN/Inf)")
+                                        nn.init.ones_(w)
+                                        fixed_count += 1
+                                        problem_layers.append(name)
+                                    elif w.abs().max() > 100:
+                                        print(f"  🔧 {name}: clip weight (max={w.abs().max():.2e})")
+                                        w.clamp_(-10, 10)
+                                        fixed_count += 1
+                                
+                                if hasattr(module, 'bias') and module.bias is not None:
+                                    b = module.bias.data
+                                    if torch.isnan(b).any() or torch.isinf(b).any():
+                                        print(f"  🔧 {name}: reinit bias (NaN/Inf)")
+                                        nn.init.zeros_(b)
+                                        fixed_count += 1
+                        
+                        # Fix general parameters
                         for name, param in self.model_maybe_fsdp.named_parameters():
                             if param.requires_grad:
-                                # Check for extreme values that could cause GELU issues
-                                if torch.abs(param).max() > 10.0:  # GELU becomes unstable with large inputs
-                                    print(f"[FIX] Clipping extreme values in parameter: {name}")
-                                    param.data.clamp_(-5.0, 5.0)  # Clip to safe range
-                                    fixed_count += 1
-                                elif torch.isnan(param).any() or torch.isinf(param).any():
-                                    print(f"[FIX] Reinitializing problematic parameter: {name}")
+                                if torch.isnan(param).any() or torch.isinf(param).any():
+                                    print(f"  🔧 Fixing NaN/Inf: {name}")
                                     if 'bias' in name:
-                                        torch.nn.init.zeros_(param)
-                                    elif 'weight' in name:
-                                        if param.dim() >= 2:
-                                            torch.nn.init.xavier_uniform_(param)
-                                        else:
-                                            torch.nn.init.normal_(param, 0, 0.02)
+                                        nn.init.zeros_(param)
+                                    elif param.dim() >= 2:
+                                        nn.init.xavier_uniform_(param)
                                     else:
-                                        torch.nn.init.normal_(param, 0, 0.02)
+                                        nn.init.normal_(param, 0, 0.02)
+                                    fixed_count += 1
+                                elif param.abs().max() > 10.0:
+                                    print(f"  🔧 Clip extreme: {name} (max={param.abs().max():.2e})")
+                                    param.data.clamp_(-10.0, 10.0)
                                     fixed_count += 1
                         
-                        print(f"[FIX] Fixed {fixed_count} parameters")
+                        print(f"[FIX] Fixed {fixed_count} parameters/modules")
+                        if problem_layers:
+                            print(f"[FIX] Problem layers: {', '.join(problem_layers[:5])}")
                         
-                        # Try backward again with fixed parameters
+                        # Retry backward
                         if fixed_count > 0:
-                            print("[FIX] Retrying backward pass...")
+                            print("[FIX] Retrying backward...")
+                            self.optimizer.zero_grad()
                             try:
                                 loss.backward(retain_graph=False, create_graph=False)
-                                print("[FIX] Backward pass succeeded after parameter fixing")
+                                print("[FIX] ✅ Backward succeeded after fix")
                             except RuntimeError as retry_e:
-                                print(f"[ERROR] Backward still failed after fixing: {retry_e}")
+                                print(f"[ERROR] ❌ Still failed: {retry_e}")
+                                print(f"[ADVICE] Try: 1) Lower LR 2) --norm_eps=1e-4 3) Check data")
                                 raise retry_e
                         else:
                             raise e
@@ -219,6 +251,7 @@ class AmpOptimizer:
         
         # clip gradients then step optimizer
         if stepping:
+            # print("[INFO] Stepping optimizer... \n self.scaler:", self.scaler , " self.early_clipping:", self.early_clipping, " self.late_clipping:", self.late_clipping)
             if self.scaler is not None: self.scaler.unscale_(self.optimizer)    # now the gradient can be correctly got
             # if self.fp is not None: self.fp.write(f'[backward_clip_step:137] [it{it}, g_it{g_it}] after scaler.unscale_\n'); self.fp.flush()
             
@@ -229,10 +262,24 @@ class AmpOptimizer:
                 self.fp.write(f'<ep{ep} it{it} {g_it}>\n'); self.fp.flush()
             if self.early_clipping:
                 c = self.grad_clip * clip_decay_ratio
-                if self.zero:
-                    orig_norm: Optional[torch.Tensor] = self.model_maybe_fsdp.clip_grad_norm_(c)
-                else:
-                    orig_norm: Optional[torch.Tensor] = torch.nn.utils.clip_grad_norm_(self.model_maybe_fsdp.parameters(), c)
+                # print(f"[INFO] Clipping gradients with threshold {c} (early clipping)")
+                # extract trainable parameters from para_groups
+                trainable_params = []
+                for group in self.optimizer.param_groups:
+                    trainable_params.extend(group['params'])
+                
+                params_with_grad = [p for p in trainable_params if p.grad is not None]
+
+                if params_with_grad:
+                    # orig_norm = torch.nn.utils.clip_grad_norm_(params_with_grad, c)
+
+                    if self.zero:
+                        orig_norm: Optional[torch.Tensor] = self.model_maybe_fsdp.clip_grad_norm_(c)
+                        if orig_norm is None:
+                            raise ValueError(f'[orig_norm is None]')
+                    else:
+                        orig_norm: Optional[torch.Tensor] = torch.nn.utils.clip_grad_norm_(params_with_grad, c)
+                        # orig_norm: Optional[torch.Tensor] = torch.nn.utils.clip_grad_norm_(self.model_maybe_fsdp.parameters(), c)
             
             # if self.fp is not None: self.fp.write(f'[backward_clip_step:175] [it{it}, g_it{g_it}] before opt step\n'); self.fp.flush()
             if self.scaler is not None:

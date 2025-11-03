@@ -32,10 +32,9 @@ class ParameterChangeVisualizer:
         # 定義模組分組
         self.module_groups = {
             'Infinity_Embedding': ['word_embed', 'pos_start', 'pos_1LC', 'lvl_embed'],
-            'CAR_Control': ['car_control_convs'],
-            'CAR_VAR': ['car_var_conv'],
+            'CAR_Control': ['car_control_proj'],
             'CAR_Blocks': ['car_blocks'],
-            'CAR_Skip': ['car_skip_norm', 'car_skip_linear'],
+            'CAR_Fusion': ['car_fusion_linears', 'car_fusion_gates'],
             'CAR_Others': ['car_'],
             'Infinity_Blocks': ['blocks'],
             'Infinity_Input': ['head_nm', 'head'],

@@ -81,6 +81,8 @@ class Args(Tap):
     min_warmup_iters: int = 2048        # minimum warmup iterations (in steps)
     car_condition_channels: int = 6     # number of channels for CAR condition input (normal map + mask)
     car_mask_drop_prob: float = 0.1     # prob of dropping mask input (use normal map only)
+    disable_car_fusion: bool = False    # disable CAR fusion into Infinity blocks (for debugging)
+    disable_car_merge: bool = False     # disable CAR weight merging from Infinity blocks when initializing
     dec: int = 1                        # dec depth
     cum: int = 3                        # cumulating fea map as GPT TF input, 0: not cum; 1: cum @ next hw, 2: cum @ final hw
     rwe: bool = False                   # random word emb
@@ -257,8 +259,8 @@ class Args(Tap):
     sync_tensorboard:bool = False   # sync to tensorboard (model structure) [True, False]
     # Ablasion studies
     car_depth:int = 4
-
-
+    rms_norm:bool = True            # whether to use RMSNorm in CAR blocks [True, False]
+    # fusion_scale_lr_scale:float = 0.01  # learning-rate multiplier applied to fusion scale parameters in CAR blocks
 
     # ==================================================================================================================
 

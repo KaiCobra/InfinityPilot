@@ -57,13 +57,26 @@ def save_checkpoint_pilot(saver, args, trainer, epoch, iteration, acc_str):
     else:
         raise AttributeError("Cannot find model in trainer")
     
+    # 如果當前模型沒有 CAR 模塊，直接跳過保存
+    base_model = model.module if hasattr(model, 'module') else model
+    has_car = getattr(base_model, 'has_car_modules', None)
+    if callable(has_car) and not has_car():
+        print("[warn] CAR modules not initialized; skipping car checkpoint save.")
+        return None
+
     # 分離 CAR 權重
     car_weights = {}
     infinity_weights = {}
     
-    for name, param in model.state_dict().items():
+    try:
+        state_dict = model.state_dict()
+    except AssertionError as exc:
+        print(f"[warn] Skipping CAR checkpoint save because state_dict fetch failed: {exc}")
+        return None
+
+    for name, param in state_dict.items():
         # 檢查是否為 CAR 參數
-        if any(car_prefix in name for car_prefix in ['car_', 'control_', 'ca.', 'cross_attn']):
+        if any(car_prefix in name for car_prefix in ['car_', 'control_']):
             car_weights[name] = param.cpu()
         else:
             infinity_weights[name] = param.cpu()
@@ -124,6 +137,7 @@ def build_everything_from_args(args: arg_util.Args, saver):
         reweight_loss_by_scale=args.reweight_loss_by_scale, gpt_wo_ddp_ema=gpt_wo_ddp_ema, 
         gpt_ema=gpt_ddp_ema, use_fsdp_model_ema=args.use_fsdp_model_ema, other_args=args,
     )
+    trainer.register_text_encoder(text_tokenizer, text_encoder)
     
     # auto resume from broken experiment
     auto_resume_info, start_ep, start_it, acc_str, eval_milestone, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
@@ -312,6 +326,8 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         car_depth=getattr(args, 'car_depth', 16),          # added
         save_car_separately=getattr(args, 'save_car_separately', True),  # added
         car_condition_channels=getattr(args, 'car_condition_channels', 3),
+        disable_car_fusion=getattr(args, 'disable_car_fusion', False),
+        disable_car_merge=getattr(args, 'disable_car_merge', False),
 
     )
     
@@ -330,11 +346,25 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         freeze_infinity=True,     # Freeze infinity
         **gpt_kw
     )
+
+    if getattr(args, 'disable_car_fusion', False):
+        print("[debug] Disabling CAR fusion as requested.")
+        gpt_wo_ddp.disable_car_fusion = True
+    if getattr(args, 'disable_car_merge', False):
+        print("[debug] Skipping CAR weight merge; using random initialization.")
+        gpt_wo_ddp.disable_car_merge = True
     
     # Step 2: Load infinity weights if available (memory efficient)
     if infinity_checkpoint is not None:
         print("[Memory Optimization] Loading Infinity weights...")
         gpt_wo_ddp.load_infinity_weights(infinity_checkpoint)
+        print("\nVerifying loaded pretrained weights...")
+        for name, param in gpt_wo_ddp.named_parameters():
+            if not param.requires_grad: # 只檢查凍結的 Infinity 權重
+                if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                    print(f"!!!!!!!!!! FATAL: NaN/Inf found in loaded parameter: {name}")
+                    raise RuntimeError("Pretrained weights are corrupted.")
+        print("✓ Pretrained weights are clean.")
         # Clear checkpoint from memory immediately after loading
         del infinity_checkpoint
         torch.cuda.empty_cache()
@@ -365,9 +395,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         torch.cuda.empty_cache()
     else:
         # Use default CAR initialization (simple Xavier)
-        print("Initializing CAR modules with default Xavier initialization")
-        gpt_wo_ddp.special_car_init(gpt_kw)
-        print("InfinityPilot initialized with automatic checkpoint loading and CAR modules trainable")
+        print("Didn't load CAR weights; using default initialization.")
     
     # Update word embedding settings if needed
     if args.rwe:
@@ -501,7 +529,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         # 只包含實際存在於可訓練參數中的 no weight decay 參數
         nowd_keys |= {
             # CAR 相關的參數
-            'car_control_convs', 'car_var_conv',
+            'car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates',
              'car_skip_norm', 'car_skip_linear',
             # 一些通用的參數（如果它們在 CAR 模塊中）
             'gamma', 'beta', 'bias',
@@ -700,7 +728,7 @@ def main_train(args: arg_util.Args):
             args.grad_boom = 'boom'
         
         AR_ep_loss = {}
-        is_val_and_also_saving = (ep + 1) % max(1, args.ep // 25) == 0 or (ep + 1) == args.ep
+        is_val_and_also_saving = (ep + 1) % max(1, args.ep // 25) == 0
         if (ep + 1) < 10:
             law_stats = {
                 'last_Lm': L_mean, 'best_Lm': min_L_mean, 'last_Am': acc_mean, 'best_Am': max_acc_mean,
@@ -711,8 +739,9 @@ def main_train(args: arg_util.Args):
             if ld_val is None or isinstance(ld_val, int):    # args.nodata or args.nova
                 last_val_loss_mean, last_val_loss_tail, last_val_acc_mean, last_val_acc_tail, tot, cost = 0.666, 0.555, 5.55, 6.66, 50000, 0.001
             else:
+                print("[DEBUG] Starting evaluation...")
                 last_val_loss_mean, last_val_loss_tail, last_val_acc_mean, last_val_acc_tail, tot, cost = trainer.eval_ep(ep, args, ld_val)
-            
+
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, last_val_loss_mean), min(best_val_loss_tail, last_val_loss_tail)
             best_val_acc_mean, best_val_acc_tail = max(best_val_acc_mean, last_val_acc_mean), max(best_val_acc_tail, last_val_acc_tail)
             AR_ep_loss['vL_mean'], AR_ep_loss['vL_tail'], AR_ep_loss['vacc_mean'], AR_ep_loss['vacc_tail'] = last_val_loss_mean, last_val_loss_tail, last_val_acc_mean, last_val_acc_tail
@@ -726,9 +755,20 @@ def main_train(args: arg_util.Args):
         if dist.is_master() and law_stats is not None:
             stat_file = os.path.join(args.bed, 'law.stat')
             if os.path.exists(stat_file):
-                with open(stat_file, 'r', encoding='utf-8') as law_fp: tag_to_epv = json.load(law_fp)
+                try:
+                    with open(stat_file, 'r', encoding='utf-8') as law_fp:
+                        raw = law_fp.read().strip()
+                        tag_to_epv = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    print(f'[warning] law.stat is not valid JSON, reinitializing: {stat_file}')
+                    tag_to_epv = {}
             else:
+                tag_to_epv = {}
+            if not tag_to_epv:
                 tag_to_epv = {tag: {} for tag in law_stats.keys()}
+            else:
+                for tag in law_stats.keys():
+                    tag_to_epv.setdefault(tag, {})
             for tag, v in law_stats.items():
                 tag_to_epv[tag][ep + 1] = v
             with open(stat_file, 'w', encoding='utf-8') as law_fp: json.dump(tag_to_epv, law_fp, indent=2)
@@ -908,6 +948,7 @@ def train_one_ep(
             
             with maybe_record_function('after_train'):
                 me.update(tlr=max_tlr)
+
     # ============================================= iteration loop ends =============================================
     
     me.synchronize_between_processes()

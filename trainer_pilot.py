@@ -38,6 +38,14 @@ except ImportError:
     VISUALIZER_AVAILABLE = False
     print("Parameter visualizer not available. Install matplotlib and seaborn for visualization.")
 
+# Import NaN detector
+try:
+    from debug_utils.nan_detector import NaNDetector
+    NAN_DETECTOR_AVAILABLE = True
+except ImportError:
+    NAN_DETECTOR_AVAILABLE = False
+    print("NaN detector not available.")
+
 import infinity.utils.dist as dist
 from infinity.models.infinity_pilot import InfinityPilot
 from infinity.models.ema import update_ema
@@ -80,15 +88,21 @@ class InfinityPilotTrainer(object):
         self.batch_size, self.seq_len = 0, 0
         self.seq_len_each = []
         self.reweight_loss_by_scale = reweight_loss_by_scale
+        self.logging_warmup_steps = max(0, int(getattr(other_args, 'logging_warmup_steps', 10))) if other_args is not None else 10
+        self.visualize_interval = max(1, int(getattr(other_args, 'visualize_interval', 100))) if other_args is not None else 100
         print(f'self.reweight_loss_by_scale: {self.reweight_loss_by_scale}')
+        self.text_tokenizer = None
+        self.text_encoder = None
         
         # Ensure CAR modules are initialized
         gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-        if hasattr(gpt_uncompiled, 'init_car_modules_if_needed'):
-            gpt_uncompiled.init_car_modules_if_needed()
-            print("CAR modules initialized in trainer")
+        if hasattr(gpt_uncompiled, 'has_car_modules'):
+            assert gpt_uncompiled.has_car_modules(), "CAR modules must be initialized before constructing the trainer"
         
-        # Print parameter counts
+        self._car_gradient_setup = False
+        self._setup_car_parameter_gradients()
+
+        # Print parameter counts (after gradient setup to reflect actual trainable stats)
         car_params = sum(p.numel() for p in gpt_uncompiled.get_car_parameters() if p.requires_grad)
         infinity_params = sum(p.numel() for p in gpt_uncompiled.get_infinity_parameters() if p.requires_grad)
         print(f"Trainable CAR parameters: {car_params:,}")
@@ -170,87 +184,149 @@ class InfinityPilotTrainer(object):
             except Exception as e:
                 print(f"⚠️ Failed to initialize parameter visualizer: {e}")
                 self.param_visualizer = None
-    
-        if hasattr(self.gpt_wo_ddp, 'init_car_modules_if_needed'):
-            self.gpt_wo_ddp.init_car_modules_if_needed()
+        
+        # Initialize NaN detector if available
+        self.nan_detector = None
+        if NAN_DETECTOR_AVAILABLE and getattr(other_args, 'enable_nan_detector', True):
+            try:
+                underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
+                self.nan_detector = NaNDetector(underlying_model, check_backward=True, verbose=True)
+                self.nan_detector.register_hooks()
+                print("✅ NaN detector initialized with hooks on all normalization layers")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize NaN detector: {e}")
+                self.nan_detector = None
 
+    def register_text_encoder(self, tokenizer, encoder):
+        """Attach tokenizer and encoder for evaluation-time caption encoding."""
+        self.text_tokenizer = tokenizer
+        self.text_encoder = encoder
+
+    def _setup_car_parameter_gradients(self):
+        """Freeze Infinity parameters once so training only updates CAR components."""
+        gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
+        if hasattr(gpt_uncompiled, 'has_car_modules'):
+            assert gpt_uncompiled.has_car_modules(), "CAR modules must be initialized before setting gradients."
+        if getattr(gpt_uncompiled, '_gradient_setup_done', False):
+            self._car_gradient_setup = True
+            return
+
+        car_param_count = 0
+        infinity_param_count = 0
+        for name, param in gpt_uncompiled.named_parameters():
+            if any(car_prefix in name for car_prefix in ['car_']):
+                param.requires_grad = True
+                car_param_count += 1
+            else:
+                param.requires_grad = False
+                infinity_param_count += 1
+
+        if dist.is_master():
+            print(f"[Gradient Setup] CAR params (trainable): {car_param_count}, Infinity params (frozen): {infinity_param_count}")
+
+        gpt_uncompiled._gradient_setup_done = True
+        self._car_gradient_setup = True
+    
     @torch.no_grad()
     def _generate_eval_visualization(self, ep: int, eval_images: List[torch.Tensor], 
-                                   eval_conditions: List[Optional[Dict[str, torch.Tensor]]], eval_prompts: List[str], args):
+                                   eval_conditions: List[Optional[Dict[str, torch.Tensor]]], eval_prompts: List[str],
+                                   eval_text_conds: List[Optional[Tuple[torch.Tensor, List[int], torch.Tensor, int]]],
+                                   args):
         """Generate visualization images during evaluation and log to wandb/tensorboard"""
         try:
             print(f"Generating evaluation visualization for epoch {ep}...")
-            
-            # Import generation utilities
-            from tools.run_infinity_pilot import gen_one_img_with_condition
             
             # Get underlying model without wrapper
             model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
             
             visualization_images = []
             
-            for i, (orig_img, condition, prompt) in enumerate(zip(eval_images, eval_conditions, eval_prompts)):
+            for i, (orig_img, condition, prompt, text_cond) in enumerate(zip(eval_images, eval_conditions, eval_prompts, eval_text_conds)):
                 if i >= 4:  # Limit to 4 samples to avoid memory issues
                     break
                     
+                if text_cond is None:
+                    print(f"[warn] Missing text condition for visualization sample {i}, skipping.")
+                    continue
+                
                 try:
+                    device = torch.device(args.device) if not isinstance(args.device, torch.device) else args.device
                     # Prepare inputs
-                    orig_img = orig_img.to(args.device)
-                    if condition is not None:
-                        condition = {k: v.to(args.device) for k, v in condition.items() if v is not None}
+                    orig_img_cpu = orig_img
+                    condition_cpu = condition
+                    condition_gpu = None
+                    if condition_cpu is not None:
+                        condition_gpu = {k: v.to(device) for k, v in condition_cpu.items() if v is not None}
                     
                     # Determine scale schedule
                     h_div_w = orig_img.shape[-2] / orig_img.shape[-1]
                     h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
                     h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
                     scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
-                    
-                    # Generate with control
-                    if condition is not None:
-                        control_tensors = model.prepare_control_for_scales(condition, scale_schedule)
-                        generated_img = model.autoregressive_infer_cfg(
-                            control_tensors=control_tensors,
-                            scale_schedule=scale_schedule,
-                            cfg=2.0,
-                            tau_list=[0.9],
-                            vae=self.vae_local,
-                            g_seed=42 + i
-                        )
+                    if getattr(args, 'apply_spatial_patchify', False):
+                        vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
                     else:
-                        # Generate without control (standard generation)
-                        generated_img = model.autoregressive_infer_cfg(
-                            scale_schedule=scale_schedule,
-                            cfg=2.0,
-                            tau_list=[0.9],
+                        vae_scale_schedule = scale_schedule
+                    
+                    text_kv, text_lens, text_cu, text_max = text_cond
+                    text_tuple_device = (
+                        text_kv.to(device),
+                        text_lens,
+                        text_cu.to(device),
+                        text_max,
+                    )
+
+                    control_tokens = None
+                    if condition_gpu:
+                        control_tokens = self._build_control_tokens(condition_gpu, vae_scale_schedule, len(scale_schedule))
+                        if control_tokens is not None:
+                            control_tokens = [t.to(device) if t is not None else None for t in control_tokens]
+
+                    cfg_list = [1.0] * len(scale_schedule)
+                    tau_list = [1.0] * len(scale_schedule)
+                    top_k = getattr(args, 'vis_top_k', getattr(model, 'top_k', 0))
+                    top_p = getattr(args, 'vis_top_p', getattr(model, 'top_p', 0.0))
+
+                    with torch.no_grad():
+                        _, _, generated_imgs = model.autoregressive_infer_cfg(
                             vae=self.vae_local,
-                            g_seed=42 + i
+                            scale_schedule=scale_schedule,
+                            label_B_or_BLT=text_tuple_device,
+                            B=1,
+                            cfg_list=cfg_list,
+                            tau_list=tau_list,
+                            top_k=top_k,
+                            top_p=top_p,
+                            ret_img=True,
+                            inference_mode=True,
+                            control_tokens=control_tokens,
                         )
+
+                    if generated_imgs is None or generated_imgs.shape[0] == 0:
+                        print(f"[warn] No generated image returned for sample {i}")
+                        continue
+                    generated_img = generated_imgs[0]
                     
                     # Create comparison grid: [Original, Condition (if exists), Generated]
                     comparison_images = []
                     
                     # Original image (normalize to [0,1])
-                    orig_display = (orig_img.squeeze(0) + 1) / 2
-                    comparison_images.append(orig_display)
+                    orig_display = (orig_img_cpu.squeeze(0) + 1) / 2
+                    comparison_images.append(orig_display.detach().cpu())
                     
                     # Condition image (if exists)
-                    if condition is not None:
-                        condition_display = (condition.squeeze(0) + 1) / 2
-                        comparison_images.append(condition_display)
+                    if condition_cpu is not None:
+                        for key, cond_tensor in condition_cpu.items():
+                            cond_display = (cond_tensor.squeeze(0) + 1) / 2
+                            comparison_images.append(cond_display.detach().cpu())
                     
                     # Generated image (normalize to [0,1])
                     if isinstance(generated_img, torch.Tensor):
-                        if generated_img.max() > 1.0:  # If in [0,255] range
-                            generated_display = generated_img.float() / 255.0
-                        else:  # If in [-1,1] or [0,1] range
-                            generated_display = (generated_img + 1) / 2 if generated_img.min() < 0 else generated_img
+                        generated_display = generated_img.float().permute(2, 0, 1) / 255.0
                     else:
-                        # Convert numpy to tensor if needed
-                        generated_display = torch.from_numpy(generated_img).permute(2, 0, 1) / 255.0
-                    
-                    if generated_display.dim() == 4:
-                        generated_display = generated_display.squeeze(0)
-                    comparison_images.append(generated_display)
+                        generated_display = torch.from_numpy(generated_img).permute(2, 0, 1).float() / 255.0
+                    generated_display = generated_display.flip(0)
+                    comparison_images.append(generated_display.clamp(0, 1).cpu())
                     
                     # Stack horizontally
                     comparison_grid = torch.cat(comparison_images, dim=2)  # Concatenate along width
@@ -319,9 +395,12 @@ class InfinityPilotTrainer(object):
         eval_images = []
         eval_conditions = []
         eval_prompts = []
+        eval_text_conds = []
         max_vis_samples = 8  # Limit number of visualization samples
-        
+
         for batch_idx, data in enumerate(ld_val):
+            if batch_idx >= max_vis_samples:
+                break # [DEBUG] limit eval batches for faster testing
             # Handle data format for pilot (with condition)
             condition_inputs = {}
             if len(data) == 4:
@@ -333,11 +412,49 @@ class InfinityPilotTrainer(object):
                 inp, label_B = data
                 condition_mask = None
                 condition_normal = None
-            
-            B = label_B.shape[0] if isinstance(label_B, torch.Tensor) else inp.shape[0]
+
+            B = inp.shape[0]
+            text_cond_tuple = label_B
             if isinstance(label_B, torch.Tensor):
-                label_B = label_B.to(args.device, non_blocking=True)
-            V = self.vae_local.vocab_size
+                text_cond_tuple = label_B.to(args.device, non_blocking=True)
+            elif isinstance(label_B, (list, tuple)):
+                if len(label_B) == 4 and isinstance(label_B[0], torch.Tensor):
+                    kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B
+                    text_cond_tuple = (
+                        kv_compact.to(args.device, non_blocking=True),
+                        lens,
+                        cu_seqlens_k.to(args.device, non_blocking=True),
+                        max_seqlen_k,
+                    )
+                elif len(label_B) > 0 and isinstance(label_B[0], str):
+                    if self.text_tokenizer is None or self.text_encoder is None:
+                        raise RuntimeError('Text tokenizer/encoder must be registered before evaluation.')
+                    captions = list(label_B)
+                    tokens = self.text_tokenizer(
+                        text=captions,
+                        max_length=self.text_tokenizer.model_max_length,
+                        padding='max_length',
+                        truncation=True,
+                        return_tensors='pt',
+                    )
+                    input_ids = tokens.input_ids.to(args.device, non_blocking=True)
+                    mask = tokens.attention_mask.to(args.device, non_blocking=True)
+                    text_features = self.text_encoder(
+                        input_ids=input_ids,
+                        attention_mask=mask,
+                    )['last_hidden_state'].float()
+                    lens: List[int] = mask.sum(dim=-1).tolist()
+                    cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
+                    max_seqlen_k = max(lens) if lens else 0
+                    kv_pieces = [feat_i[:len_i] for len_i, feat_i in zip(lens, text_features.unbind(0))]
+                    kv_compact = torch.cat(kv_pieces, dim=0) if kv_pieces else text_features.new_zeros(0, text_features.shape[-1])
+                    text_cond_tuple = (kv_compact, lens, cu_seqlens_k, max_seqlen_k)
+                else:
+                    text_cond_tuple = label_B
+            else:
+                text_cond_tuple = label_B
+            use_bit_label = getattr(self.gpt_wo_ddp, 'use_bit_label', False)
+            V = getattr(self.gpt_wo_ddp, 'V', self.vae_local.vocab_size)
             inp = inp.to(args.device, non_blocking=True)
             if condition_normal is not None:
                 condition_normal = condition_normal.to(args.device, non_blocking=True)
@@ -346,176 +463,309 @@ class InfinityPilotTrainer(object):
                 condition_mask = condition_mask.to(args.device, non_blocking=True)
                 condition_inputs['mask'] = condition_mask
             
-            gt_ms_idx_Bl: List[Ten] = self.vae_local.get_GPT_ground_truth(inp)
+            h_div_w = inp.shape[-2] / inp.shape[-1]
+            h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
+            h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
+            full_scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
+            with torch.no_grad():
+                if args.apply_spatial_patchify:
+                    vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in full_scale_schedule]
+                else:
+                    vae_scale_schedule = full_scale_schedule
+                raw_features, _, _ = self.vae_local.encode_for_raw_features(inp, scale_schedule=vae_scale_schedule)
+                x_BLC_wo_prefix_full, gt_ms_idx_Bl = self.bitwise_self_correction.flip_requant(
+                    vae_scale_schedule=vae_scale_schedule,
+                    inp_B3HW=inp,
+                    raw_features=raw_features,
+                    device=inp.device,
+                )
+
+            available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl))
+            if available_scales == 0:
+                continue
+            full_scale_schedule = full_scale_schedule[:available_scales]
+            gt_ms_idx_Bl = gt_ms_idx_Bl[:available_scales]
             
-            gt_BL = torch.cat(gt_ms_idx_Bl, dim=1)
-            
-            # Prepare control tensors for InfinityPilot
+            full_control_tokens = None
+            raw_features_condition_mask = None
+            raw_features_condition_normal = None
             if condition_inputs:
-                h_div_w = inp.shape[-2] / inp.shape[-1]
-                h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
-                h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
-                scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
-                control_tensors = self.gpt_wo_ddp.prepare_control_for_scales(condition_inputs, scale_schedule)
-            else:
-                control_tensors = None
-                # Use default scale schedule if no condition
-                h_div_w = inp.shape[-2] / inp.shape[-1]
-                h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
-                h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
-                scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
+                with torch.no_grad():
+                    if args.apply_spatial_patchify:
+                        vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in full_scale_schedule]
+                    else:
+                        vae_scale_schedule = full_scale_schedule
+                    if condition_inputs.get('mask') is not None:
+                        raw_features_condition_mask, _, _ = self.vae_local.encode_for_raw_features(condition_inputs['mask'], scale_schedule=vae_scale_schedule)
+                    if condition_inputs.get('normal') is not None:
+                        raw_features_condition_normal, _, _ = self.vae_local.encode_for_raw_features(condition_inputs['normal'], scale_schedule=vae_scale_schedule)
+                control_tokens_by_type = {}
+                if raw_features_condition_mask is not None:
+                    control_tokens_by_type['mask'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_mask)
+                if raw_features_condition_normal is not None:
+                    control_tokens_by_type['normal'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_normal)
+                if control_tokens_by_type:
+                    full_control_tokens = self._combine_control_tokens(control_tokens_by_type, len(full_scale_schedule))
             
+            training_scales = min(args.always_training_scales, len(full_scale_schedule))
+            scale_schedule = full_scale_schedule[:training_scales]
+            gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
+            if len(scale_schedule) == 0:
+                continue
+            control_tokens = None
+            if full_control_tokens is not None:
+                control_tokens = full_control_tokens[:training_scales]
+            training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
+            first_scale_tokens = int(np.prod(scale_schedule[0]))
+            x_BLC_wo_prefix = x_BLC_wo_prefix_full[:, :(training_seq_len-first_scale_tokens), :]
+            gt_BL = torch.cat(gt_ms_idx_Bl, dim=1).to(x_BLC_wo_prefix.device, dtype=torch.long)
+
             self.gpt_wo_ddp.forward
-            logits_BLV = self.gpt_wo_ddp(label_B, self.quantize_local.fuse_multiscale_idx_as_gpt_inp_BL(gt_ms_idx_Bl), 
-                                        scale_schedule=scale_schedule, control_tensors=control_tensors)
+            logits_BLV = self.gpt_wo_ddp(text_cond_tuple, x_BLC_wo_prefix, 
+                                        scale_schedule=scale_schedule, control_tokens=control_tokens)
             
-            L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
-            L_tail += self.val_loss(logits_BLV.data[:, -self.raw_last_l:].reshape(-1, V), gt_BL[:, -self.raw_last_l:].reshape(-1)) * B
-            acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
-            acc_tail += (logits_BLV.data[:, -self.raw_last_l:].argmax(dim=-1) == gt_BL[:, -self.raw_last_l:]).sum() * (100/self.raw_last_l)
+            last_scale_area = int(np.prod(scale_schedule[-1]))
+            B, seq_len = logits_BLV.shape[:2]
+            if use_bit_label:
+                logits_bits = logits_BLV.reshape(B, seq_len, -1, 2)
+                ce_bits = self.val_loss(logits_bits.permute(0, 3, 1, 2), gt_BL)
+                bitloss_type = getattr(args, 'bitloss_type', 'mean')
+                if bitloss_type == 'mean':
+                    token_loss = ce_bits.mean(dim=-1)
+                elif bitloss_type == 'sum':
+                    token_loss = ce_bits.sum(dim=-1)
+                else:
+                    raise NotImplementedError(f'{bitloss_type=}')
+                per_sample_loss = token_loss.mean(dim=-1)
+                tail_loss = token_loss[:, -last_scale_area:].mean(dim=-1)
+                L_mean += per_sample_loss.sum().item()
+                L_tail += tail_loss.sum().item()
+
+                bitwise_acc = (logits_bits.argmax(dim=-1) == gt_BL).float()
+                token_bit_acc = bitwise_acc.mean(dim=-1)
+                per_sample_bit_acc = token_bit_acc.mean(dim=-1)
+                tail_bit_acc = token_bit_acc[:, -last_scale_area:].mean(dim=-1)
+                acc_mean += per_sample_bit_acc.sum().item() * 100.0
+                acc_tail += tail_bit_acc.sum().item() * 100.0
+            else:
+                logits_view = logits_BLV.reshape(-1, V)
+                token_loss = self.val_loss(logits_view, gt_BL.reshape(-1)).view(B, -1)
+                per_sample_loss = token_loss.mean(dim=-1)
+                tail_loss = token_loss[:, -last_scale_area:].mean(dim=-1)
+                L_mean += per_sample_loss.sum().item()
+                L_tail += tail_loss.sum().item()
+
+                pred_BL = logits_BLV.argmax(dim=-1)
+                per_sample_acc = (pred_BL == gt_BL).float().mean(dim=-1)
+                tail_acc = (pred_BL[:, -last_scale_area:] == gt_BL[:, -last_scale_area:]).float().mean(dim=-1)
+                acc_mean += per_sample_acc.sum().item() * 100.0
+                acc_tail += tail_acc.sum().item() * 100.0
             tot += B
             
             # Collect samples for visualization (only from master process and first few batches)
             if dist.is_master() and len(eval_images) < max_vis_samples and batch_idx < 4:
                 # Store original images, conditions, and generate samples for visualization
-                for i in range(min(B, max_vis_samples - len(eval_images))):
+                remaining_slots = max_vis_samples - len(eval_images)
+                num_samples = min(B, remaining_slots)
+                for i in range(num_samples):
                     eval_images.append(inp[i:i+1].cpu())  # Keep original image
-                if condition_inputs:
-                    eval_conditions.append({k: v[i:i+1].cpu() for k, v in condition_inputs.items()})
-                else:
-                    eval_conditions.append(None)
-                    eval_prompts.append(f"Sample_{len(eval_images)}")
+                    if condition_inputs:
+                        sample_condition = {k: v[i:i+1].cpu() for k, v in condition_inputs.items()}
+                    else:
+                        sample_condition = None
+                    eval_conditions.append(sample_condition)
+                    eval_prompts.append(f"val_sample_{len(eval_prompts)}")
+                    eval_text_conds.append(self._slice_text_cond_for_eval(text_cond_tuple, i))
                     
         self.gpt_wo_ddp.train(training)
         
-        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
+        device = torch.device(args.device)
+        stats = torch.tensor([L_mean, L_tail, acc_mean, acc_tail, float(tot)], device=device)
         dist.allreduce(stats)
-        tot = round(stats[-1].item())
-        stats /= tot
-        L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
+        tot_float = stats[-1].item()
+        if tot_float == 0:
+            return 0.0, 0.0, 0.0, 0.0, 0, time.time() - stt
+        tot = int(round(tot_float))
+        stats = stats[:-1] / tot
+        L_mean, L_tail, acc_mean, acc_tail = stats.tolist()
         
         # Generate visualization images during evaluation
         if dist.is_master() and len(eval_images) > 0:
-            self._generate_eval_visualization(ep, eval_images, eval_conditions, eval_prompts, args)
+            self._generate_eval_visualization(ep, eval_images, eval_conditions, eval_prompts, eval_text_conds, args)
         
         return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
+
+    def _build_control_tokens(self, condition_inputs: Optional[Dict[str, torch.Tensor]], vae_scale_schedule, training_scales):
+        if condition_inputs is None or len(condition_inputs) == 0:
+            return None
+        control_tokens_by_type = {}
+        with torch.no_grad():
+            if condition_inputs.get('mask') is not None:
+                mask = condition_inputs['mask']
+                raw_features_mask, _, _ = self.vae_local.encode_for_raw_features(mask, scale_schedule=vae_scale_schedule)
+                control_tokens_by_type['mask'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_mask)
+            if condition_inputs.get('normal') is not None:
+                normal = condition_inputs['normal']
+                raw_features_normal, _, _ = self.vae_local.encode_for_raw_features(normal, scale_schedule=vae_scale_schedule)
+                control_tokens_by_type['normal'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_normal)
+        if not control_tokens_by_type:
+            return None
+        return self._combine_control_tokens(control_tokens_by_type, training_scales)
+
+    @staticmethod
+    def _combine_control_tokens(control_tokens_by_type: Dict[str, List[torch.Tensor]], training_scales: int):
+        if not control_tokens_by_type:
+            return None
+        control_tokens = []
+        for si in range(training_scales):
+            tokens_at_scale = []
+            for tokens_list in control_tokens_by_type.values():
+                if si < len(tokens_list):
+                    tokens_at_scale.append(tokens_list[si])
+            if tokens_at_scale:
+                control_tokens.append(torch.cat(tokens_at_scale, dim=1))
+            else:
+                control_tokens.append(None)
+        return control_tokens
+    
+    @staticmethod
+    def _slice_text_cond_for_eval(text_tuple, index: int) -> Optional[Tuple[torch.Tensor, List[int], torch.Tensor, int]]:
+        if not isinstance(text_tuple, tuple) or len(text_tuple) != 4:
+            return None
+        kv_compact, lens, cu_seqlens_k, max_seqlen_k = text_tuple
+        if isinstance(lens, torch.Tensor):
+            lens_list = lens.tolist()
+        else:
+            lens_list = list(lens)
+        if index >= len(lens_list):
+            return None
+        start = sum(int(l) for l in lens_list[:index])
+        length = int(lens_list[index])
+        kv_slice = kv_compact[start:start+length].detach().cpu()
+        cu = torch.tensor([0, length], dtype=torch.int32)
+        return (kv_slice, [length], cu, length)
     
     def train_step(
         self, ep: int, it: int, g_it: int, stepping: bool, clip_decay_ratio: float,
         metric_lg: misc.MetricLogger, logging_params: bool,
-        inp_B3HW: FTen, condition_inputs: Optional[Dict[str, torch.Tensor]], text_cond_tuple: Union[ITen, FTen], args: arg_util.Args,
+        inp_B3HW: FTen, condition_inputs: Optional[Dict[str, FTen]], text_cond_tuple: Union[ITen, FTen], args: arg_util.Args,
     ) -> Tuple[torch.Tensor, Optional[float]]:
         
         B = inp_B3HW.shape[0]  # if isinstance(inp_B3HW, torch.Tensor) else inp_B3HW[0].shape[0]
         T = 1 if inp_B3HW.dim() == 4 else inp_B3HW.shape[2]
         V = self.vae_local.vocab_size
         device = inp_B3HW.device
+        warmup_steps = self.logging_warmup_steps
+        should_visualize_batch = (it % 50 == 0 and dist.is_master())
+        full_gt_ms_idx_Bl = None
 
         h_div_w = inp_B3HW.shape[-2] / inp_B3HW.shape[-1]
         h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
         h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
-        scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
-        scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
+        full_scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
+        full_scale_schedule = [(min(t, T//4+1), h, w) for (t, h, w) in full_scale_schedule]
         
+
         # [forward]
+        
+        # # Check input for NaN/Inf before forward pass
+        # if g_it < 50 and torch.isnan(inp_B3HW).any():
+        #     print(f"❌ [it={it}] NaN in input inp_B3HW!")
+        #     print(f"   Shape: {inp_B3HW.shape}, Device: {inp_B3HW.device}")
+        # if g_it < 50 and torch.isinf(inp_B3HW).any():
+        #     print(f"❌ [it={it}] Inf in input inp_B3HW!")
+        
         with self.gpt_opt.amp_ctx:
-            with torch.amp.autocast('cuda', enabled=False):
-                with torch.no_grad():
-                    if args.apply_spatial_patchify:
-                        vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
-                    else:
-                        vae_scale_schedule = scale_schedule
-                    raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=vae_scale_schedule)
-            
+            # with torch.amp.autocast('cuda', enabled=False):
+            raw_features_condition_mask = None
+            raw_features_condition_normal = None
+            with torch.no_grad():
+                if args.apply_spatial_patchify:
+                    full_vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in full_scale_schedule]
+                else:
+                    full_vae_scale_schedule = full_scale_schedule
+                vae_scale_schedule = full_vae_scale_schedule
+                raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=vae_scale_schedule)
+                # take out normal map and text mask condition if exists
+                if condition_inputs is not None:
+                    if condition_inputs.get('mask') is not None:
+                        condition_mask = condition_inputs.get('mask')
+                        raw_features_condition_mask, _, _ = self.vae_local.encode_for_raw_features(condition_mask, scale_schedule=vae_scale_schedule) 
+                    if condition_inputs.get('normal') is not None:
+                        condition_normal = condition_inputs.get('normal')
+                        raw_features_condition_normal, _, _ = self.vae_local.encode_for_raw_features(condition_normal, scale_schedule=vae_scale_schedule)
+
+
+
             x_BLC_wo_prefix, gt_ms_idx_Bl = self.bitwise_self_correction.flip_requant(vae_scale_schedule, inp_B3HW, raw_features, device)
-            # x_BLC_wo_prefix: torch.Size([bs, 2*2+3*3+...+64*64, d or 4d])
+            if should_visualize_batch:
+                full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl]
+            control_tokens_by_type = {}
+            if raw_features_condition_mask is not None:
+                control_tokens_by_type['mask'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_mask)
+            if raw_features_condition_normal is not None:
+                control_tokens_by_type['normal'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_normal)
+            full_control_tokens = None
+            if control_tokens_by_type:
+                full_control_tokens = self._combine_control_tokens(control_tokens_by_type, len(full_scale_schedule))
 
             # truncate scales
-            training_scales = args.always_training_scales
-            training_seq_len = np.array(scale_schedule)[:training_scales].prod(axis=1).sum()
+            available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl))
+            training_scales = min(args.always_training_scales, available_scales)
+            if training_scales == 0:
+                raise RuntimeError("No valid scales available; check VAE outputs or dynamic resolution settings.")
+            scale_schedule = full_scale_schedule[:training_scales]
+            gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
+            control_tokens = None
+            if full_control_tokens is not None:
+                control_tokens = full_control_tokens[:training_scales]
+            training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
             x_BLC_wo_prefix = x_BLC_wo_prefix[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
 
-            # Prepare control tensors for InfinityPilot
-            control_tensors = None
-            if condition_inputs is not None:
-                control_tensors = self.gpt_wo_ddp.prepare_control_for_scales(condition_inputs, scale_schedule[:training_scales])
 
+            # [forward]
             self.gpt_wo_ddp.forward  
             
-            # Auto-fix any NaN/Inf parameters before forward pass
-            nan_params = []
-            inf_params = []
-            for name, param in self.gpt.named_parameters():
-                if torch.isnan(param).any():
-                    nan_params.append(name)
-                if torch.isinf(param).any():
-                    inf_params.append(name)
-            
-            if nan_params or inf_params:
-                print(f"[WARNING] Found problematic parameters - attempting to fix...")
-                if nan_params:
-                    print(f"[WARNING] NaN parameters: {nan_params}")
-                if inf_params:
-                    print(f"[WARNING] Inf parameters: {inf_params}")
-                
-                # Auto-fix NaN/Inf parameters by reinitializing them
-                for name, param in self.gpt.named_parameters():
-                    if torch.isnan(param).any() or torch.isinf(param).any():
-                        print(f"[FIX] Reinitializing parameter: {name}")
-                        if 'bias' in name:
-                            nn.init.zeros_(param)
-                        elif 'weight' in name:
-                            if param.dim() >= 2:
-                                nn.init.xavier_uniform_(param)
-                            else:
-                                nn.init.normal_(param, 0, 0.02)
-                        else:
-                            nn.init.normal_(param, 0, 0.02)
-                
-                print(f"[FIX] Parameter reinitialization completed")
 
-            # Check CAR module initialization and ensure proper gradient flow
-            gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-            has_car = hasattr(gpt_uncompiled, 'has_car_modules') and gpt_uncompiled.has_car_modules()
-            if not has_car:
-                gpt_uncompiled.init_car_modules_if_needed()
-                print("[WARNING] CAR modules were not initialized, initializing now")
-            
-            # Ensure only CAR parameters require grad for DDP
-            if not hasattr(gpt_uncompiled, '_gradient_setup_done'):
-                car_param_count = 0
-                infinity_param_count = 0
-                for name, param in gpt_uncompiled.named_parameters():
-                    if any(car_prefix in name for car_prefix in ['car_']):
-                        param.requires_grad = True
-                        car_param_count += 1
-                    else:
-                        param.requires_grad = False  # Freeze Infinity parameters
-                        infinity_param_count += 1
-                print(f"[Gradient Setup] CAR params (trainable): {car_param_count}, Infinity params (frozen): {infinity_param_count}")
-                gpt_uncompiled._gradient_setup_done = True
-            
-            logits_BLV = self.gpt(text_cond_tuple, x_BLC_wo_prefix, scale_schedule=scale_schedule[:training_scales], control_tensors=control_tensors) # [bs, 1*1+...+64*64, vocab_size or log2(vocab_size)*2]
+            if not self._car_gradient_setup:
+                self._setup_car_parameter_gradients()
+            # print(f'scale_schedule: {scale_schedule}')
+            logits_BLV = self.gpt(text_cond_tuple, x_BLC_wo_prefix, scale_schedule=scale_schedule, control_tokens=control_tokens) # [bs, 1*1+...+64*64, vocab_size or log2(vocab_size)*2]
             self.batch_size, self.seq_len = logits_BLV.shape[:2]
 
             self.seq_len_each = [idx_Bl.shape[1] for idx_Bl in gt_ms_idx_Bl]
             
             gt_BL = torch.cat(gt_ms_idx_Bl, dim=1)[:,:training_seq_len].contiguous().type(torch.long) # [bs, 1*1+...+64*64, 16] or [bs, 1*1+...+64*64]
-            
-            # 檢查 logits 是否包含 NaN 或 inf
-            # if not torch.isfinite(logits_BLV).all():
-            #     print(f"[ERROR] Non-finite values in logits_BLV")
-            #     print(f"[DEBUG] logits_BLV contains nan: {torch.isnan(logits_BLV).any()}")
-            #     print(f"[DEBUG] logits_BLV contains inf: {torch.isinf(logits_BLV).any()}")
-            #     print(f"[DEBUG] logits_BLV min: {logits_BLV.min()}")
-            #     print(f"[DEBUG] logits_BLV max: {logits_BLV.max()}")
-            #     raise RuntimeError("Non-finite values in logits before loss calculation")
-            
-            # 檢查 logits 的數值範圍，如果過大可能導致數值不穩定
-            # logits_max = logits_BLV.max().item()
-            # logits_min = logits_BLV.min().item()
-            # if abs(logits_max) > 100 or abs(logits_min) > 100:
-            #     print(f"[WARNING] Large logits values detected: min={logits_min:.2f}, max={logits_max:.2f}")
+
+            if should_visualize_batch and full_gt_ms_idx_Bl is not None and args.use_bit_label:
+                pred_ms_idx_Bl: List[torch.Tensor] = []
+                seq_len_vis = logits_BLV.shape[1]
+                logits_bits = logits_BLV.reshape(B, seq_len_vis, -1, 2)
+                pred_bits = logits_bits.argmax(dim=-1)
+
+                cursor = 0
+                for scale_tensor in gt_ms_idx_Bl:
+                    scale_len = scale_tensor.shape[1]
+                    pred_slice = pred_bits[:, cursor:cursor + scale_len]
+                    pred_ms_idx_Bl.append(pred_slice.contiguous().reshape(B, scale_len, scale_tensor.shape[-1]))
+                    cursor += scale_len
+
+                self.generate_training_visualization(
+                    ep,
+                    it,
+                    g_it,
+                    inp_B3HW,
+                    condition_inputs,
+                    gt_ms_idx_Bl,
+                    pred_ms_idx_Bl,
+                    scale_schedule,
+                    training_scales,
+                    training_seq_len,
+                    full_gt_ms_idx_Bl,
+                    full_scale_schedule,
+                    full_vae_scale_schedule,
+                )
+
             
             if args.use_bit_label:
                 tmp_bs, tmp_seq_len, tmp_channel = logits_BLV.shape
@@ -529,45 +779,13 @@ class InfinityPilotTrainer(object):
             else:
                 raw_loss = self.train_loss(logits_BLV.reshape(-1, V), gt_BL.reshape(-1)).reshape(B, -1)
 
-            # Guard against non-finite raw loss before weighting
-            # if not torch.isfinite(raw_loss).all():
-            #     print("[ERROR] Non-finite values detected in raw loss before weighting")
-            #     nan_mask = torch.isnan(raw_loss)
-            #     inf_mask = torch.isinf(raw_loss)
-            #     if torch.numel(raw_loss):
-            #         finite_mask = torch.isfinite(raw_loss)
-            #         print(f"[DEBUG] raw_loss finite ratio: {finite_mask.float().mean().item():.6f}")
-            #     print(f"[DEBUG] raw_loss contains nan: {nan_mask.any().item()}, inf: {inf_mask.any().item()}")
-            #     if torch.numel(raw_loss):
-            #         finite_vals = raw_loss[torch.isfinite(raw_loss)]
-            #         if finite_vals.numel() > 0:
-            #             print(f"[DEBUG] raw_loss finite stats -> min: {finite_vals.min().item()}, max: {finite_vals.max().item()}, mean: {finite_vals.mean().item()}, std: {finite_vals.std().item()}")
-            #     print(f"[DEBUG] logits_BLV stats -> shape: {tuple(logits_BLV.shape)}, min: {logits_BLV.min().item()}, max: {logits_BLV.max().item()}, mean: {logits_BLV.mean().item()}, std: {logits_BLV.std().item()}")
-            #     print(f"[DEBUG] gt_BL stats -> shape: {tuple(gt_BL.shape)}, dtype: {gt_BL.dtype}, min: {gt_BL.min().item()}, max: {gt_BL.max().item()}, unique count: {torch.unique(gt_BL).numel()}")
-            #     uniq_vals, counts = torch.unique(gt_BL, return_counts=True)
-            #     topk = min(10, uniq_vals.numel())
-            #     print(f"[DEBUG] gt_BL unique top {topk}: {list(zip(uniq_vals[:topk].tolist(), counts[:topk].tolist()))}")
-            #     if torch.any(nan_mask):
-            #         nan_indices = torch.nonzero(nan_mask)
-            #         print(f"[DEBUG] raw_loss nan count: {nan_indices.shape[0]}")
-            #         for idx in nan_indices[:5]:
-            #             idx_list = idx.tolist()
-            #             gt_val = None
-            #             if len(idx_list) <= gt_BL.dim():
-            #                 try:
-            #                     gt_val = gt_BL[tuple(idx_list[:gt_BL.dim()])].item()
-            #                 except Exception:
-            #                     gt_val = "unavailable"
-            #             print(f"[DEBUG] raw_loss nan at index {idx_list}, corresponding gt_BL: {gt_val}")
-            #     if args.use_bit_label:
-            #         print(f"[DEBUG] bit-label mode -> tmp_bs={tmp_bs}, tmp_seq_len={tmp_seq_len}, tmp_channel={tmp_channel}")
-            #     raise RuntimeError("Raw loss is not finite before applying scale weights")
 
             if self.reweight_loss_by_scale:
                 lw = []
                 last_scale_area = np.sqrt(np.prod(scale_schedule[-1]))
                 # print(f"last_scale_area: {last_scale_area}")
-                for (pt, ph, pw) in scale_schedule[:training_scales]:
+                # print(f"scale_schedule: {scale_schedule}")
+                for (pt, ph, pw) in scale_schedule:
                     this_scale_area = np.sqrt(pt * ph * pw)
                     lw.extend([last_scale_area / this_scale_area for _ in range(pt * ph * pw)])
                 lw = torch.tensor(lw, device=raw_loss.device, dtype=raw_loss.dtype).unsqueeze(0)
@@ -581,115 +799,27 @@ class InfinityPilotTrainer(object):
                 lw = 1. / self.seq_len
                 weighted_loss = raw_loss * lw
 
-            # if not torch.isfinite(weighted_loss).all():
-            #     print("[ERROR] Non-finite values detected after applying loss weights")
-            #     print(f"[DEBUG] weighted_loss nan: {torch.isnan(weighted_loss).any().item()}, inf: {torch.isinf(weighted_loss).any().item()}")
-            #     print(f"[DEBUG] raw_loss stats -> min: {raw_loss.min().item()}, max: {raw_loss.max().item()}, mean: {raw_loss.mean().item()}")
-            #     if self.reweight_loss_by_scale:
-            #         print(f"[DEBUG] lw stats -> min: {lw.min().item()}, max: {lw.max().item()}, sum: {lw.sum().item()}, shape: {lw.shape}")
-            #         print(f"[DEBUG] scale_schedule[:{training_scales}]: {scale_schedule[:training_scales]}")
-            #     raise RuntimeError("Weighted loss is not finite")
 
             loss = weighted_loss.sum(dim=-1).mean()
 
-            # if not torch.isfinite(loss).item():
-            #     print("[ERROR] Final scalar loss became non-finite")
-            #     print(f"[DEBUG] weighted_loss per-sample -> min: {weighted_loss.min().item()}, max: {weighted_loss.max().item()}, mean: {weighted_loss.mean().item()}")
-            #     print(f"[DEBUG] raw_loss per-token -> min: {raw_loss.min().item()}, max: {raw_loss.max().item()}, mean: {raw_loss.mean().item()}")
-            #     if self.reweight_loss_by_scale:
-            #         print(f"[DEBUG] lw stats -> min: {lw.min().item()}, max: {lw.max().item()}, sum: {lw.sum().item()}, shape: {lw.shape}")
-            #         print(f"[DEBUG] scale_schedule[:{training_scales}]: {scale_schedule[:training_scales]}")
-            #         print(f"[DEBUG] training_seq_len: {training_seq_len}, raw_loss.shape: {raw_loss.shape}, weighted_loss.shape: {weighted_loss.shape}")
-            #     raise RuntimeError("Final loss is not finite after reduction")
-
-            # if args.car_scale_reg > 0:
-            #     car_skip = None
-            #     car_depth_attr = getattr(args, 'car_depth', None)
-            #     if self.zero:
-            #         fsdp_module = self.gpt
-            #         with FSDP.summon_full_params(fsdp_module, writeback=False, recurse=False):
-            #             wrapped = getattr(fsdp_module, "module", None)
-            #             if wrapped is None:
-            #                 wrapped = getattr(fsdp_module, "_fsdp_wrapped_module", None)
-            #             if wrapped is not None and hasattr(wrapped, "car_skip_scale"):
-            #                 car_skip = wrapped.car_skip_scale.detach().clone()
-            #                 model_car_depth = getattr(wrapped, "car_depth", None)
-            #             else:
-            #                 model_car_depth = None
-            #     else:
-            #         model_car_depth = getattr(gpt_uncompiled, "car_depth", None)
-            #         car_skip = getattr(gpt_uncompiled, "car_skip_scale", None)
-
-            #     print(f"[DEBUG] CAR regularization check: args.car_scale_reg={args.car_scale_reg}, args.car_depth={car_depth_attr}, model.car_depth={model_car_depth}, car_skip_shape={tuple(car_skip.shape) if isinstance(car_skip, torch.Tensor) else None}")
-
-            #     if car_skip is None:
-            #         print("[WARNING] car_skip_scale is None while car_scale_reg > 0")
-            #     else:
-            #         if car_skip.numel() == 0:
-            #             print("[ERROR] car_skip_scale has zero elements; check car_depth and CAR initialization.")
-            #             raise RuntimeError("car_skip_scale is empty")
-            #         if car_skip.device != loss.device:
-            #             print(f"[WARNING] car_skip_scale device {car_skip.device} differs from loss device {loss.device}")
-            #         car_skip_mean = torch.mean(car_skip)
-            #         car_skip_std = torch.std(car_skip)
-            #         car_skip_min = torch.min(car_skip)
-            #         car_skip_max = torch.max(car_skip)
-            #         print(f"[DEBUG] car_skip_scale stats -> min: {car_skip_min.item()}, max: {car_skip_max.item()}, mean: {car_skip_mean.item()}, std: {car_skip_std.item()}")
-            #         reg_term = car_skip.pow(2).mean()
-            #         if not torch.isfinite(reg_term):
-            #             print("[ERROR] car_scale_reg term is non-finite")
-            #             print(f"[DEBUG] reg_term: {reg_term.item()}")
-            #             raise RuntimeError("car_scale_reg produced non-finite value")
-            #         loss_before_reg = loss
-            #         loss = loss + args.car_scale_reg * reg_term
-            #         if not torch.isfinite(loss):
-            #             print("[ERROR] Loss became non-finite after adding car_scale_reg term")
-            #             print(f"[DEBUG] loss_before_reg: {loss_before_reg.item()}, reg_term: {reg_term.item()}, car_scale_reg: {args.car_scale_reg}")
-            #             raise RuntimeError("Final loss is not finite after adding car_scale_reg")
-
         # [backward]
+        # Check loss before backward
+        # if torch.isnan(loss).any() or torch.isinf(loss).any():
+        #     print(f"❌ [it={it}] Loss is NaN/Inf before backward: {loss.item()}")
+        #     if self.nan_detector:
+        #         print(self.nan_detector.get_summary())
+        #     raise RuntimeError(f"Loss is NaN/Inf at it={it}")
+        
         grad_norm_t, scale_log2_t = self.gpt_opt.backward_clip_step(ep=ep, it=it, g_it=g_it, stepping=stepping, logging_params=logging_params, loss=loss, clip_decay_ratio=clip_decay_ratio, stable=args.stable)
         
-        # Update parameter visualizer
-        if self.param_visualizer is not None and stepping and False:
-            self.param_visualizer.update(g_it)
-
-            # Generate visualization every 100 steps or at specific milestones
-            if False and (g_it % 100 == 0 or it < 5):
-                try:
-                    self.param_visualizer.plot_module_heatmap(g_it)
-                    if it < 3:  # Generate architecture diagram for first few iterations
-                        self.param_visualizer.plot_architecture_diagram(g_it)
-                except Exception as e:
-                    print(f"⚠️ Visualization error at iteration {g_it}: {e}")
-        
-        # Debug parameter freeze status for first few iterations
-        if it % 20 == 0 and dist.is_master():
-        # if False: 
-            # self._debug_parameter_freeze_status(it)
-            # [visualize] the result in wandb
-            self.generate_training_visualization(
-                ep, it, g_it, 
-                inp_B3HW, condition_inputs, 
-                gt_ms_idx_Bl, text_cond_tuple, 
-                scale_schedule, training_scales, training_seq_len
-            )
-
-        
-        # Debug: Check parameter gradient status for DDP
-        # if stepping and args.dbg and it < 3:  # Only for first few iterations
-        #     grad_params = []
-        #     no_grad_params = []
-        #     gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-        #     for name, param in gpt_uncompiled.named_parameters():
-        #         if param.requires_grad:
-        #             if param.grad is not None:
-        #                 grad_params.append(name)
-        #             else:
-        #                 no_grad_params.append(name)
-            # print(f"[DEBUG] Iteration {it}: {len(grad_params)} params with grad, {len(no_grad_params)} params without grad")
-            # if no_grad_params:
-            #     print(f"[DEBUG] No grad params: {no_grad_params[:5]}...")  # Show first 5
+        # # Check if NaN detector caught anything
+        # if self.nan_detector and self.nan_detector.nan_layers and g_it < 100:
+        #     print(f"\n{'='*80}")
+        #     print(f"🔴 NaN DETECTION SUMMARY at it={it}, g_it={g_it}")
+        #     print(self.nan_detector.get_summary())
+        #     print(f"{'='*80}\n")
+        #     # Clear for next iteration
+        #     self.nan_detector.clear()
         
         # update ema
         if args.use_fsdp_model_ema:
@@ -697,6 +827,92 @@ class InfinityPilotTrainer(object):
 
         # [zero_grad]
         if stepping:
+            grad_stats = {}
+             # 梯度監控
+            if dist.is_master(): # 只在主進程執行
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                import pandas as pd
+                import io
+                from PIL import Image
+                model_to_check = self.gpt_wo_ddp
+                if hasattr(model_to_check, '_orig_mod'):
+                    model_to_check = model_to_check._orig_mod
+                
+                # 創建一個字典來收集所有梯度統計
+                grad_data = []
+                def collect_grad_stats(name, module_or_param):
+                    if isinstance(module_or_param, torch.nn.Module):
+                        params = module_or_param.parameters()
+                    else:
+                        params = [module_or_param]
+
+                    grads = [p.grad for p in params if p.grad is not None]
+                    
+                    mean_abs_grad = 0.0
+                    if grads:
+                        all_grads = torch.cat([g.detach().abs().view(-1) for g in grads])
+                        mean_abs_grad = all_grads.mean().item()
+                    
+                    grad_data.append({"module": name, "mean_abs_grad": mean_abs_grad})
+
+                # 1. 收集所有 CAR 模塊的梯度數據
+                if hasattr(model_to_check, 'car_control_proj'):
+                    collect_grad_stats('ControlProj', model_to_check.car_control_proj)
+                if hasattr(model_to_check, 'car_blocks'):
+                    for i, car_block in enumerate(model_to_check.car_blocks):
+                        collect_grad_stats(f'Block_{i:02d}', car_block)
+                if hasattr(model_to_check, 'car_output_norms'):
+                    for i, norm_layer in enumerate(model_to_check.car_output_norms):
+                        collect_grad_stats(f'OutputNorm_{i:02d}', norm_layer)
+                if hasattr(model_to_check, 'car_fusion_linears'):
+                    for i, linear_layer in enumerate(model_to_check.car_fusion_linears):
+                        collect_grad_stats(f'FusionLinear_{i:02d}', linear_layer)
+                if hasattr(model_to_check, 'car_fusion_scales'):
+                    collect_grad_stats('FusionScales', model_to_check.car_fusion_scales)
+
+                # 2. 如果收集到了數據，則繪圖並上傳
+                if grad_data:
+                    # 將數據轉換為 pandas DataFrame 以便繪圖
+                    df = pd.DataFrame(grad_data)
+                    
+                    # 創建圖表
+                    plt.style.use('seaborn-v0_8-whitegrid')
+                    # 根據模塊數量動態調整圖表高度
+                    fig_height = max(8, len(grad_data) * 0.3)
+                    fig, ax = plt.subplots(figsize=(12, fig_height))
+                    
+                    # 繪製水平條形圖，梯度值大的在上面
+                    df_sorted = df.sort_values("mean_abs_grad", ascending=False)
+                    sns.barplot(x="mean_abs_grad", y="module", data=df_sorted, ax=ax, palette="viridis_r")
+                    
+                    # 美化圖表
+                    ax.set_title(f'CAR Modules Mean Absolute Gradient (Global Step: {g_it})', fontsize=16)
+                    ax.set_xlabel('Mean Absolute Gradient (log scale)', fontsize=12)
+                    ax.set_ylabel('Module', fontsize=12)
+                    ax.set_xscale('log') # 使用對數尺度，以便清晰地比較不同數量級的梯度
+
+                    # 在條形上顯示數值，使用科學記數法
+                    for container in ax.containers:
+                        ax.bar_label(container, fmt='%.2e', padding=5, fontsize=9)
+
+                    plt.tight_layout()
+                    
+                    # 將圖表保存到內存緩衝區
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', dpi=120) # 提高 dpi 以獲得更清晰的圖像
+                    buf.seek(0)
+                    
+                    # 使用 PIL 從緩衝區讀取圖像
+                    img = Image.open(buf)
+                    
+                    # 上傳到 WandB
+                    wandb_utils.log({"Chart/CAR_Gradient_Distribution": wandb_utils.wandb.Image(img)})
+                    
+                    # 關閉圖表以釋放內存
+                    plt.close(fig)
+                    buf.close()
+                    
             if self.using_ema: pass # self.ema_update(g_it)
             if self.dbg_unused:
                 ls = []
@@ -709,7 +925,8 @@ class InfinityPilotTrainer(object):
             self.gpt_opt.optimizer.zero_grad(set_to_none=True)
         
         # [metric logging]
-        if metric_lg.log_every_iter or it == 0 or it in metric_lg.log_iters:
+        should_log_iter = metric_lg.log_every_iter or it in metric_lg.log_iters or it == warmup_steps
+        if it >= warmup_steps and should_log_iter:
             B, seq_len = logits_BLV.shape[:2]
             if args.use_bit_label:
                 res_loss = self.train_loss(logits_BLV.reshape(B, seq_len, -1, 2).permute(0,3,1,2), gt_BL).mean(dim=-1).mean(0)
@@ -791,6 +1008,9 @@ class InfinityPilotTrainer(object):
                     print(f"⚠️ WandB parameter logging error: {e}")
             
             # wandb_utils.log(wandb_log_dict, step=g_it)
+            # 如果收集到了統計數據，就用 wandb 記錄
+            if grad_stats:
+                wandb_utils.log(grad_stats, step=g_it) # 使用全局步數 g_it
             wandb_utils.log(wandb_log_dict)
         
         return grad_norm_t, scale_log2_t
@@ -851,7 +1071,7 @@ class InfinityPilotTrainer(object):
                 car_state = {}
                 
                 for key, value in full_state.items():
-                    if any(car_prefix in key for car_prefix in ['car_control_convs', 'car_var_conv', 'car_blocks', 'car_skip_norm', 'car_skip_linear']):
+                    if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
                         car_state[key] = value
                     else:
                         infinity_state[key] = value
@@ -865,7 +1085,7 @@ class InfinityPilotTrainer(object):
                     ema_car_state = {}
                     
                     for key, value in ema_full_state.items():
-                        if any(car_prefix in key for car_prefix in ['car_control_convs', 'car_var_conv', 'car_blocks', 'car_skip_norm', 'car_skip_linear']):
+                        if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
                             ema_car_state[key] = value
                         else:
                             ema_infinity_state[key] = value
@@ -886,7 +1106,7 @@ class InfinityPilotTrainer(object):
                 ema_car_state = {}
                 
                 for key, value in full_ema_state.items():
-                    if any(car_prefix in key for car_prefix in ['car_control_convs', 'car_var_conv', 'car_blocks', 'car_skip_norm', 'car_skip_linear']):
+                    if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
                         ema_car_state[key] = value.cpu()
                     else:
                         ema_infinity_state[key] = value.cpu()
@@ -902,7 +1122,7 @@ class InfinityPilotTrainer(object):
             car_state = {}
             
             for key, value in full_state.items():
-                if any(car_prefix in key for car_prefix in ['car_control_convs', 'car_var_conv', 'car_blocks', 'car_skip_norm', 'car_skip_linear']):
+                if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
                     car_state[key] = value
                 else:
                     infinity_state[key] = value
@@ -919,8 +1139,8 @@ class InfinityPilotTrainer(object):
     def load_state_dict(self, state, strict=True, skip_vae=False, car_ckpt_path=None):
         # Ensure CAR modules are initialized before loading
         gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-        if hasattr(gpt_uncompiled, 'init_car_modules_if_needed'):
-            gpt_uncompiled.init_car_modules_if_needed()
+        if hasattr(gpt_uncompiled, 'has_car_modules'):
+            assert gpt_uncompiled.has_car_modules(), "CAR modules must be initialized before loading state"
         
         if self.zero:  # FSDP 模式
             with FSDP.state_dict_type(self.gpt, StateDictType.FULL_STATE_DICT, fullstate_save_policy, fulloptstate_save_policy):
@@ -1177,21 +1397,41 @@ class InfinityPilotTrainer(object):
         if has_grad_infinity > 0:
             raise RuntimeError(f"Infinity parameters have gradients! Count: {has_grad_infinity}")
 
-    def generate_training_visualization(self, ep: int, it: int, g_it: int, 
-                                    inp_B3HW: torch.Tensor, condition_inputs: Optional[Dict[str, torch.Tensor]], 
-                                    gt_ms_idx_Bl: List[torch.Tensor], text_cond_tuple: Tuple[torch.Tensor, torch.Tensor], 
-                                    scale_schedule: List[Tuple[int, int, int]], training_scales: int, training_seq_len: int):
+    def generate_training_visualization(
+        self,
+        ep: int,
+        it: int,
+        g_it: int,
+        inp_B3HW: torch.Tensor,
+        condition_inputs: Optional[Dict[str, torch.Tensor]],
+        gt_ms_idx_Bl: List[torch.Tensor],
+        pred_ms_idx_Bl: List[torch.Tensor],
+        scale_schedule: List[Tuple[int, int, int]],
+        training_scales: int,
+        training_seq_len: int,
+        full_gt_ms_idx_Bl: List[torch.Tensor],
+        full_scale_schedule: List[Tuple[int, int, int]],
+        full_vae_scale_schedule: List[Tuple[int, int, int]],
+    ):
         """Generate training visualization using current step results"""
         # Only run on master process to avoid duplicate visualizations
         if not dist.is_master():
+            return None
+        if not getattr(self.gpt_wo_ddp, 'use_bit_label', False):
             return None
             
         try:
             return _generate_training_visualization(
                 self, ep, it, g_it, 
                 inp_B3HW, condition_inputs, 
-                gt_ms_idx_Bl, text_cond_tuple, 
-                scale_schedule, training_scales, training_seq_len
+                gt_ms_idx_Bl,
+                pred_ms_idx_Bl,
+                scale_schedule,
+                training_scales,
+                training_seq_len,
+                full_gt_ms_idx_Bl,
+                full_scale_schedule,
+                full_vae_scale_schedule,
             )
         except Exception as e:
             print(f"⚠️ Visualization generation error at iteration {g_it}: {e}")

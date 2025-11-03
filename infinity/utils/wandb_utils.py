@@ -61,14 +61,14 @@ def initialize(args, exp_name, project_name,):
         # 檢查環境變量
         api_key = os.environ.get('WANDB_API_KEY')
         entity = os.environ.get('WANDB_ENTITY')
-        print(f"[DEBUG] API Key present: {bool(api_key)}")
-        print(f"[DEBUG] Entity: {entity}")
+        # print(f"[DEBUG] API Key present: {bool(api_key)}")
+        # print(f"[DEBUG] Entity: {entity}")
         
-        print("[DEBUG] Attempting online login...")
+        # print("[DEBUG] Attempting online login...")
         wandb.login(key=api_key, relogin=True)
-        print("[DEBUG] Successfully logged in to wandb")
+        # print("[DEBUG] Successfully logged in to wandb")
         
-        print("[DEBUG] Attempting wandb.init...")
+        # print("[DEBUG] Attempting wandb.init...")
         wandb.init(
             project=project_name,
             name=exp_name,
@@ -76,8 +76,8 @@ def initialize(args, exp_name, project_name,):
             entity=entity,
             sync_tensorboard=args.sync_tensorboard
         )
-        print("[DEBUG] Successfully initialized wandb in online mode")
-        print(f"[DEBUG] Run URL: {wandb.run.url if wandb.run else 'N/A'}")
+        # print("[DEBUG] Successfully initialized wandb in online mode")
+        # print(f"[DEBUG] Run URL: {wandb.run.url if wandb.run else 'N/A'}")
         
     except Exception as e:
         print(f"[WARNING] Failed to initialize wandb in online mode: {e}")

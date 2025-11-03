@@ -36,7 +36,7 @@ def log_parameter_stats_to_wandb(model, step, prefix="param_monitor"):
             param_norm = torch.norm(param).item()
             
             # 分類參數
-            if any(car_prefix in name for car_prefix in ['car_control_convs', 'car_var_conv', 'car_blocks', 'car_skip_norm', 'car_skip_linear']):
+            if any(car_prefix in name for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
                 car_params.append(name)
                 car_param_norms.append(param_norm)
                 
@@ -102,7 +102,7 @@ def create_parameter_change_table(model, baseline_params, step):
                 relative_change = diff / (param_norm + 1e-8)
                 
                 # 確定參數類型
-                if any(car_prefix in name for car_prefix in ['car_control_convs', 'car_var_conv', 'car_blocks']):
+                if any(car_prefix in name for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
                     param_type = "CAR"
                 elif any(inf_prefix in name for inf_prefix in ['blocks', 'word_embed', 'pos_start']):
                     param_type = "Infinity"

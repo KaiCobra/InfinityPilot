@@ -14,8 +14,10 @@ torchrun \
     train_pilot.py \
     --ep=100 --opt=adamw --cum=3 \
     --sche=lin0 \
-    --fp16=0 \
+    --fp16=2 \
     --ada=0.9_0.97 \
+    --oeps=1e-6 \
+    --norm_eps=1e-4 \
     --tini=-1 \
     --tclip=5 \
     --flash=0 \
@@ -23,18 +25,17 @@ torchrun \
     --saln=1 \
     --cos=1 \
     --cdec=True \
-    --enable_checkpointing=full-block \
-    --local_out_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000 \
+    --local_out_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy \
     --task_type=t2i \
     --bed=/mnt/syndata/VAR_ckpt/checkpoints/pilot \
-    --data_path=/mnt/syndata/toy_data/ \
+    --data_path=/mnt/syndata/toy_data \
     --video_data_path= \
-    --exp_name=pilot_debug_$date \
+    --exp_name=pilot_a6000_bsqvae_parallel_toy_$date \
     --project_name=InfinityPilot \
     --tblr=1e-4 \
     --pn=1M \
     --model=2bc8 \
-    --lbs=4 \
+    --lbs=1 \
     --workers=1 \
     --short_cap_prob=0.0 \
     --online_t5=1 \
@@ -42,11 +43,11 @@ torchrun \
     --iterable_data_buffersize=500 \
     --Ct5=2048 \
     --t5_path=weights/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001 \
-    --rush_resume=/mnt/syndata/VAR_ckpt/infinity_2b_reg.pth \
+    --rush_resume=weights/mm_2b.pth \
     --vae_type=32 \
     --vae_ckpt=weights/infinity_vae_d32_reg.pth \
-    --wp0=0.1 \
-    --wp=0.0 \
+    --wp0=0.2 \
+    --wp=0.1 \
     --wpe=0.05 \
     --dynamic_resolution_across_gpus=1 \
     --enable_dynamic_length_prompt=0 \
@@ -55,11 +56,11 @@ torchrun \
     --rope2d_each_sa_layer=1 \
     --rope2d_normalized_by_hw=2 \
     --use_fsdp_model_ema=0 \
-    --always_training_scales=7 \
+    --always_training_scales=13 \
     --use_bit_label=1 \
-    --zero=3 \
+    --zero=2 \
     --save_car_epoch_freq=1 \
-    --log_freq=50 \
+    --log_freq=10 \
     --checkpoint_type=torch \
     --prefetch_factor=2 \
     --noise_apply_strength=0.3 \
@@ -70,6 +71,11 @@ torchrun \
     --save_car_separately=True \
     --car_depth=4 \
     --special_car_init=merge \
+    --disable_car_fusion=False \
+    --disable_car_merge=False \
+    --enable_checkpointing=0 \
+    --rms_norm=True \
     # --sync_tensorboard=True,
     # --car_resume_path=None \
     # --debug=False, \
+    # --enable_checkpointing=full-block \

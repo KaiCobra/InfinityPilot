@@ -1,16 +1,29 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import cv2
 import traceback
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from infinity.utils import arg_util, misc, wandb_utils
 
 
 @torch.no_grad()
-def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int, 
-                                   inp_B3HW: torch.Tensor, condition_inputs: Optional[Dict[str, torch.Tensor]], 
-                                   gt_ms_idx_Bl: List[torch.Tensor], text_cond_tuple, 
-                                   scale_schedule, training_scales: int, training_seq_len: int):
+def _generate_training_visualization(
+    trainer_self,
+    ep: int,
+    it: int,
+    g_it: int,
+    inp_B3HW: torch.Tensor,
+    condition_inputs: Optional[Dict[str, torch.Tensor]],
+    gt_ms_idx_Bl: List[torch.Tensor],
+    pred_ms_idx_Bl: List[torch.Tensor],
+    scale_schedule,
+    training_scales: int,
+    training_seq_len: int,
+    full_gt_ms_idx_Bl,
+    full_scale_schedule,
+    full_vae_scale_schedule,
+):
     """Generate visualization images during training using current training step results and log to wandb"""
     try:
         # Only generate visualizations occasionally to avoid overhead
@@ -21,9 +34,16 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
         
         # Get device from input
         device = inp_B3HW.device
+        effective_scales = min(training_scales, len(scale_schedule), len(gt_ms_idx_Bl))
+        if effective_scales == 0:
+            return None
+        scale_schedule = scale_schedule[:effective_scales]
+        gt_ms_idx_Bl = gt_ms_idx_Bl[:effective_scales]
+        training_scales = effective_scales
+        training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
         
-        # Limit to first 2 samples to avoid memory issues
-        vis_batch_size = min(2, inp_B3HW.shape[0])
+        # Limit to first sample to run a single inference pass
+        vis_batch_size = min(1, inp_B3HW.shape[0])
         inp_vis = inp_B3HW[:vis_batch_size]
         if condition_inputs is not None:
             condition_vis = {k: v[:vis_batch_size] for k, v in condition_inputs.items() if v is not None}
@@ -32,134 +52,65 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
         else:
             condition_vis = None
         
-        # Use current training step's ground truth tokens to reconstruct images
+        gt_tokens_vis = [gt[:vis_batch_size] for gt in gt_ms_idx_Bl]
+        seq_lengths = [gt.shape[1] for gt in gt_tokens_vis]
+        full_gt_tokens_vis = (
+            [gt[:vis_batch_size] for gt in full_gt_ms_idx_Bl]
+            if full_gt_ms_idx_Bl is not None
+            else gt_tokens_vis
+        )
+
+        pred_tokens_vis = None
+        if pred_ms_idx_Bl:
+            pred_tokens_vis = [pred[:vis_batch_size] for pred in pred_ms_idx_Bl]
+
+        if trainer_self.bitwise_self_correction.apply_spatial_patchify:
+            vae_scale_schedule = [(pt, 2 * ph, 2 * pw) for pt, ph, pw in scale_schedule]
+            full_vae_schedule = [(pt, 2 * ph, 2 * pw) for pt, ph, pw in full_scale_schedule]
+        else:
+            vae_scale_schedule = scale_schedule
+            full_vae_schedule = full_scale_schedule
+
+        final_vae_scale = full_vae_scale_schedule[-1] if full_vae_scale_schedule else full_vae_schedule[-1]
+        gt_images = _decode_tokens_to_image(
+            trainer_self,
+            full_gt_tokens_vis,
+            full_scale_schedule,
+            full_vae_schedule,
+            final_vae_scale,
+        )
+
+        pred_images = None
+        if pred_tokens_vis is not None:
+            pred_tokens_full = []
+            for si in range(len(full_scale_schedule)):
+                if si < len(pred_tokens_vis):
+                    pred_tokens_full.append(pred_tokens_vis[si])
+                elif full_gt_tokens_vis is not None and si < len(full_gt_tokens_vis):
+                    pred_tokens_full.append(full_gt_tokens_vis[si])
+            if full_gt_tokens_vis is not None and len(pred_tokens_full) < len(full_scale_schedule):
+                pred_tokens_full.extend(full_gt_tokens_vis[len(pred_tokens_full):len(full_scale_schedule)])
+            if pred_tokens_full:
+                pred_images = _decode_tokens_to_image(
+                    trainer_self,
+                    pred_tokens_full,
+                    full_scale_schedule,
+                    full_vae_schedule,
+                    final_vae_scale,
+                )
+
         reconstruction_images = []
-        
+
         for i in range(vis_batch_size):
             try:
-                # Get single sample
-                single_inp = inp_vis[i:i+1]  # [1, 3, H, W] - original input
+                single_inp = inp_vis[i:i+1]
                 single_condition = None
                 if condition_vis is not None:
                     single_condition = {k: v[i:i+1] for k, v in condition_vis.items()}
-                
-                # Get ground truth tokens for this sample
-                single_gt_tokens = [gt_tokens[i:i+1] for gt_tokens in gt_ms_idx_Bl]
-                
-                # 參考 infinity_pilot.py 的 autoregressive_infer_cfg 方法進行重建
-                try:
-                    if hasattr(trainer_self, 'vae_local') and trainer_self.vae_local is not None:
-                        vae = trainer_self.vae_local
-                        
-                        # 使用與 autoregressive_infer_cfg 相同的重建邏輯
-                        if hasattr(trainer_self.gpt_wo_ddp, 'use_bit_label') and trainer_self.gpt_wo_ddp.use_bit_label:
-                            # BSQ-VAE bit label 處理方式
-                            # print(f"Debug: Using BSQ-VAE reconstruction with bit labels")
-                            
-                            # 將 gt tokens 轉換為正確格式
-                            summed_codes = None
-                            final_scale_h, final_scale_w = scale_schedule[training_scales-1][1:]  # 最終尺度
-                            
-                            # 處理每個尺度的 tokens
-                            for si, (gt_tokens_scale, (pt, ph, pw)) in enumerate(zip(single_gt_tokens[:training_scales], scale_schedule[:training_scales])):
-                                try:
-                                    # 重新整形 tokens 以匹配 BSQ-VAE 的期望格式
-                                    if gt_tokens_scale.dim() == 2:  # [1, L]
-                                        seq_len = pt * ph * pw
-                                        if gt_tokens_scale.shape[1] == seq_len:
-                                            # 沒有 bit dimension，直接使用
-                                            gt_tokens_reshaped = gt_tokens_scale.reshape(1, ph, pw, -1)
-                                        else:
-                                            # 有 bit dimension，需要重新整形
-                                            bits_per_token = gt_tokens_scale.shape[1] // seq_len
-                                            gt_tokens_reshaped = gt_tokens_scale.reshape(1, seq_len, bits_per_token)
-                                            gt_tokens_reshaped = gt_tokens_reshaped.reshape(1, ph, pw, bits_per_token)
-                                    elif gt_tokens_scale.dim() == 3:  # [1, L, D]
-                                        gt_tokens_reshaped = gt_tokens_scale.reshape(1, ph, pw, -1)
-                                    else:
-                                        # print(f"Unexpected token dimension: {gt_tokens_scale.shape}")
-                                        continue
-                                    
-                                    # 添加時間維度 [B, t, h, w, d] -> [1, 1, h, w, d]
-                                    gt_tokens_with_time = gt_tokens_reshaped.unsqueeze(1)
-                                    
-                                    # print(f"Debug: Scale {si}, gt_tokens shape: {gt_tokens_with_time.shape}")
-                                    
-                                    # 使用 VAE 的 quantizer 將 indices 轉換為 codes
-                                    if hasattr(vae, 'quantizer') and hasattr(vae.quantizer, 'lfq'):
-                                        codes = vae.quantizer.lfq.indices_to_codes(gt_tokens_with_time, label_type='bit_label')
-                                        # print(f"Debug: Scale {si}, codes shape: {codes.shape}")
-                                        
-                                        # 修復插值操作：正確處理 5D tensor
-                                        if si != training_scales - 1:
-                                            # 對於非最後一個尺度，插值到最終尺度並累加
-                                            # codes 格式: [B, C, T, H, W] -> [1, 32, 1, h, w]
-                                            # 需要先移除時間維度進行插值，然後再加回
-                                            codes_2d = codes.squeeze(2)  # [1, 32, h, w] - 移除時間維度
-                                            upsampled_2d = torch.nn.functional.interpolate(
-                                                codes_2d, size=(final_scale_h, final_scale_w), mode='nearest'
-                                            )  # [1, 32, final_h, final_w]
-                                            upsampled = upsampled_2d.unsqueeze(2)  # [1, 32, 1, final_h, final_w] - 重新加入時間維度
-                                            
-                                            if summed_codes is None:
-                                                summed_codes = upsampled
-                                            else:
-                                                summed_codes = summed_codes + upsampled
-                                        else:
-                                            # 最後一個尺度直接累加
-                                            if summed_codes is None:
-                                                summed_codes = codes
-                                            else:
-                                                summed_codes = summed_codes + codes
-                                    else:
-                                        # print(f"VAE quantizer not found or incompatible")
-                                        break
-                                        
-                                except Exception as scale_error:
-                                    print(f"Error processing scale {si}: {scale_error}")
-                                    continue
-                            
-                            # 解碼最終的 summed_codes
-                            if summed_codes is not None and summed_codes.numel() > 0:
-                                # print(f"Debug: Final summed_codes shape: {summed_codes.shape}")
-                                # 移除時間維度進行解碼: [1, 32, 1, h, w] -> [1, 32, h, w]
-                                summed_codes_for_decode = summed_codes.squeeze(-3)
-                                reconstructed_img = vae.decode(summed_codes_for_decode)
-                                # print(f"Debug: Reconstructed image shape: {reconstructed_img.shape}")
-                            else:
-                                raise ValueError("Failed to accumulate codes")
-                        else:
-                            # 傳統 VAE 處理方式
-                            # print(f"Debug: Using traditional VAE reconstruction")
-                            # 使用最大尺度的 tokens
-                            largest_tokens = single_gt_tokens[-1]
-                            
-                            # 嘗試直接解碼
-                            if hasattr(vae, 'decode_from_indices'):
-                                reconstructed_img = vae.decode_from_indices(largest_tokens)
-                            else:
-                                # fallback to token visualization
-                                raise AttributeError("Traditional VAE decode not implemented")
-                    else:
-                        raise AttributeError("VAE not available")
-                    
-                    # 確保重建圖像在正確設備上
-                    reconstructed_img = reconstructed_img.to(device)
-                    
-                except Exception as vae_error:
-                    # print(f"VAE decode failed: {vae_error}, using simple token visualization")
-                    traceback.print_exc()
-                    # Fallback: Create a simple visualization of token values
-                    reconstructed_img = _visualize_tokens_as_image(single_gt_tokens, scale_schedule[:training_scales], device)
-                
-                # Create comparison grid: [Original, Condition (if exists), GT Reconstruction]
-                comparison_images = []
-                
-                # Original input image (normalize from [-1,1] to [0,1] and ensure on device)
+
                 orig_display = torch.clamp(single_inp.squeeze(0), -1, 1).to(device)
-                comparison_images.append(orig_display)
-                
-                # Condition image (if exists)
+                comparison_images = [orig_display]
+
                 if single_condition is not None:
                     if 'normal' in single_condition:
                         comparison_images.append(torch.clamp(single_condition['normal'].squeeze(0), -1, 1).to(device))
@@ -168,53 +119,30 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
                         if mask_img.shape[0] == 1:
                             mask_img = mask_img.repeat(3, 1, 1)
                         comparison_images.append(mask_img)
-                
-                # Ground truth reconstruction (normalize and ensure on device)
-                if isinstance(reconstructed_img, torch.Tensor):
-                    if reconstructed_img.dim() == 4:
-                        reconstructed_img = reconstructed_img.squeeze(0)  # Remove batch dim
-                    
-                    # Ensure on correct device
-                    reconstructed_img = reconstructed_img.to(device)
-                    
-                    # Normalize based on the range of values (參考 infinity_pilot.py line 1129-1130)
-                    # img = (img + 1) / 2
-                    recon_display = torch.clamp(reconstructed_img, -1, 1)
-                        
-                else:
-                    # Convert numpy to tensor if needed
-                    recon_display = torch.from_numpy(reconstructed_img).permute(2, 0, 1).to(device)
-                    if recon_display.max() > 1.0:
-                        recon_display = recon_display / 127.5 - 1.0
-                        recon_display = torch.clamp( recon_display, -1, 1)
 
-                comparison_images.append(recon_display)
-                
-                # Ensure all images have the same spatial dimensions
+                gt_display = torch.clamp(gt_images[i], -1, 1).to(device)
+                comparison_images.append(gt_display)
+
+                if pred_images is not None:
+                    pred_display = torch.clamp(pred_images[i], -1, 1).to(device)
+                    comparison_images.append(pred_display)
+
                 target_h, target_w = orig_display.shape[-2:]
                 resized_comparison = []
                 for img in comparison_images:
                     if img.shape[-2:] != (target_h, target_w):
-                        img_resized = torch.nn.functional.interpolate(
-                            img.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False
-                        ).squeeze(0)
+                        img_resized = F.interpolate(img.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(0)
                         resized_comparison.append(img_resized)
                     else:
                         resized_comparison.append(img)
-                
-                # Stack horizontally: [Original | Condition | GT Reconstruction] or [Original | GT Reconstruction]
-                comparison_grid = torch.cat(resized_comparison, dim=2)  # Concatenate along width
+
+                comparison_grid = torch.cat(resized_comparison, dim=2)
                 reconstruction_images.append(comparison_grid)
-                
-            except Exception as e:
-                # print(f"Error processing training sample {i}: {e}")
+
+            except Exception:
                 traceback.print_exc()
-                
-                # Create a placeholder image if processing fails
                 h, w = inp_vis.shape[-2:]
-                num_images = 2
-                if condition_vis is not None:
-                    num_images += len(condition_vis)
+                num_images = 3 + (len(condition_vis) if condition_vis is not None else 0)
                 placeholder = torch.zeros(3, h, w * num_images, device=device)
                 reconstruction_images.append(placeholder)
                 continue
@@ -272,6 +200,73 @@ def _generate_training_visualization(trainer_self, ep: int, it: int, g_it: int,
     except Exception as e:
         print(f"Error in training visualization: {e}")
         traceback.print_exc()
+
+
+def _decode_tokens_to_image(
+    trainer_self,
+    tokens_per_scale: List[torch.Tensor],
+    scale_schedule,
+    vae_scale_schedule,
+    final_vae_scale,
+    reference_tokens: Optional[List[torch.Tensor]] = None,
+):
+    if not tokens_per_scale and not reference_tokens:
+        return torch.zeros(0, device=trainer_self.vae_local.decoder.weight.device)
+
+    vae = trainer_self.vae_local
+    use_bit_label = getattr(trainer_self.gpt_wo_ddp, 'use_bit_label', False)
+    apply_patchify = getattr(trainer_self.bitwise_self_correction, 'apply_spatial_patchify', False)
+
+    if tokens_per_scale:
+        B = tokens_per_scale[0].shape[0]
+        device = tokens_per_scale[0].device
+    else:
+        B = reference_tokens[0].shape[0]
+        device = reference_tokens[0].device
+
+    prepared_tokens: List[torch.Tensor] = []
+    for si, _ in enumerate(scale_schedule):
+        if si < len(tokens_per_scale):
+            prepared_tokens.append(tokens_per_scale[si])
+        else:
+            if reference_tokens is None or si >= len(reference_tokens):
+                raise ValueError(f"Missing tokens for scale {si} and no reference provided")
+            prepared_tokens.append(torch.zeros_like(reference_tokens[si]))
+
+    summed_codes = None
+    for si, tokens in enumerate(prepared_tokens):
+        pt, ph, pw = scale_schedule[si]
+        if use_bit_label:
+            tokens_si = tokens.reshape(B, pt, ph, pw, -1)
+            if apply_patchify:
+                d = tokens_si.shape[-1]
+                tokens_si = tokens_si.reshape(B * pt, ph, pw, d).permute(0, 3, 1, 2)
+                tokens_si = torch.nn.functional.pixel_shuffle(tokens_si, 2)
+                tokens_si = tokens_si.permute(0, 2, 3, 1).reshape(B, pt, ph * 2, pw * 2, d // 4)
+            if tokens_si.dim() == 4:
+                tokens_si = tokens_si.unsqueeze(1)
+            codes = vae.quantizer.lfq.indices_to_codes(tokens_si, label_type='bit_label')
+        else:
+            raise NotImplementedError("Visualizer decode only implemented for bit-label mode")
+
+        if codes.dim() == 4:
+            codes = codes.unsqueeze(2)
+        if codes.dim() != 5:
+            raise ValueError(f"Unexpected code tensor rank {codes.dim()} while decoding visualization")
+        target_size = final_vae_scale
+        if isinstance(target_size, int):
+            target_size = (1, target_size, target_size)
+        elif len(target_size) == 2:
+            target_size = (1, *target_size)
+        target_size = tuple(int(x) for x in target_size)
+        upsampled = F.interpolate(codes, size=target_size, mode=vae.quantizer.z_interplote_up)
+        if summed_codes is None:
+            summed_codes = upsampled
+        else:
+            summed_codes = summed_codes + upsampled
+
+    img = vae.decoder(summed_codes.squeeze(-3))
+    return torch.clamp(img, -1, 1)
 
 
 def _visualize_tokens_as_image(gt_tokens_list: List[torch.Tensor], scale_schedule, device) -> torch.Tensor:

@@ -106,4 +106,49 @@ class BitwiseSelfCorrection(object):
         print(f'Save to {save_path}')
         import pdb; pdb.set_trace()
         print(cat_image.shape)
+
+    def requant(self, vae_scale_schedule, raw_features):
+        """
+        Re-quantize multiscale features without diffusion forcing noise.
+        Returns per-scale tokens shaped (B, L_scale, dim_scale).
+        """
+        with torch.amp.autocast('cuda', enabled=False):
+            B = raw_features.shape[0]
+            if raw_features.dim() == 4:
+                codes_out = raw_features.unsqueeze(2)
+            else:
+                codes_out = raw_features
+
+            cum_var_input = 0
+            per_scale_tokens = []
+
+            for si, (pt, ph, pw) in enumerate(vae_scale_schedule):
+                residual = codes_out - cum_var_input
+                if si != len(vae_scale_schedule) - 1:
+                    residual = F.interpolate(
+                        residual,
+                        size=vae_scale_schedule[si],
+                        mode=self.vae.quantizer.z_interplote_down,
+                    ).contiguous()
+
+                quantized, _, _, _ = self.vae.quantizer.lfq(residual)
+
+                tokens = quantized.squeeze(2)  # B, d, h, w
+                if self.apply_spatial_patchify:
+                    tokens = torch.nn.functional.pixel_unshuffle(tokens, 2)
+                tokens = tokens.flatten(2).transpose(1, 2).contiguous()
+                per_scale_tokens.append(tokens)
+
+                cum_var_input = cum_var_input + F.interpolate(
+                    quantized,
+                    size=vae_scale_schedule[-1],
+                    mode=self.vae.quantizer.z_interplote_up,
+                ).contiguous()
+
+        # [Debug delete later]
+        for tokens in per_scale_tokens:
+            if torch.isnan(tokens).any() or torch.isinf(tokens).any():
+                raise ValueError(f"[NaN control token]")
+
+        return per_scale_tokens
         
