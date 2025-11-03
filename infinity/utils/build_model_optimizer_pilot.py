@@ -293,7 +293,7 @@ def build_model_optimizer(args, vae_ckpt):
         # 只包含實際存在於可訓練參數中的 no weight decay 參數
         nowd_keys |= {
             # CAR 相關的參數
-            'car_control_convs', 'car_var_conv', 'car_skip_norm', 'car_skip_linear',
+            'car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates',
             # 一些通用的參數（如果它們在 CAR 模塊中）
             'gamma', 'beta', 'bias',
         }

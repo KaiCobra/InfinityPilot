@@ -56,7 +56,7 @@ torchrun \
     --rope2d_each_sa_layer=1 \
     --rope2d_normalized_by_hw=2 \
     --use_fsdp_model_ema=0 \
-    --always_training_scales=13 \
+    --always_training_scales=100 \
     --use_bit_label=1 \
     --zero=2 \
     --save_car_epoch_freq=1 \
@@ -64,7 +64,7 @@ torchrun \
     --checkpoint_type=torch \
     --prefetch_factor=2 \
     --noise_apply_strength=0.3 \
-    --noise_apply_layers=13 \
+    --noise_apply_layers=10 \
     --apply_spatial_patchify=0 \
     --use_flex_attn=False \
     --pad=128 \
@@ -73,9 +73,10 @@ torchrun \
     --special_car_init=merge \
     --disable_car_fusion=False \
     --disable_car_merge=False \
-    --enable_checkpointing=0 \
     --rms_norm=True \
+    --enable_checkpointing=full-block \
+    # --enable_checkpointing=0 \
     # --sync_tensorboard=True,
     # --car_resume_path=None \
     # --debug=False, \
-    # --enable_checkpointing=full-block \
+    

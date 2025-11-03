@@ -545,14 +545,14 @@ class InfinityPilot(Infinity):
             for block_idx in range(self.car_depth)
         ])
 
-        self.car_output_norms = nn.ModuleList([
-            norm_layer(self.C)  
+        self.car_fusion_norms = nn.ModuleList([
+            norm_layer(2*self.C)  
             # nn.LayerNorm(self.C, eps=init_kwargs.get('norm_eps', 1e-4))
             for _ in range(self.car_depth)
         ])
 
         self.car_fusion_linears = nn.ModuleList([
-            nn.Linear(self.C, self.C)
+            nn.Linear(2 * self.C, self.C)
             for _ in range(self.car_depth)
         ])
 
@@ -561,7 +561,7 @@ class InfinityPilot(Infinity):
             if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
 
-        self.car_fusion_scales = nn.Parameter(torch.zeros(self.car_depth))
+        # self.car_fusion_scales = nn.Parameter(torch.zeros(self.car_depth))
 
         # Initialize CAR blocks by borrowing weights from corresponding Infinity transformer blocks
         if not getattr(self, 'disable_car_merge', False) and hasattr(self, 'blocks') and len(self.blocks) >= self.car_depth:
@@ -839,12 +839,17 @@ class InfinityPilot(Infinity):
             if entry is None:
                 return seq
             car_idx, car_feat = entry
-            car_feat = self.car_output_norms[car_idx](car_feat)
+            # car_feat = self.car_output_norms[car_idx](car_feat)
 
             # ====================== CAR fusion ======================
-            fusion = self.car_fusion_linears[car_idx](car_feat).to(seq.dtype)
-            fusion = fusion * torch.clamp(F.softplus(self.car_fusion_scales[car_idx]), max=10.0)
-            seq = seq + fusion
+            # fusion = self.car_fusion_linears[car_idx](car_feat).to(seq.dtype)
+            # fusion = fusion * torch.clamp(F.softplus(self.car_fusion_scales[car_idx]), max=1.0)
+            # seq = seq + fusion
+            # ==================== CAR cat fusion ====================
+            seq_with_car = torch.cat([seq, car_feat], dim=-1) # 1. 串接
+            seq_with_car = self.car_fusion_norms[car_idx](seq_with_car) # 2. LayerNorm
+            fusion_delta = self.car_fusion_linears[car_idx](seq_with_car) # 3. 線性投影
+            seq = seq + fusion_delta # 4. 殘差連接
 
             return seq
 

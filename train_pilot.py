@@ -101,10 +101,21 @@ def save_checkpoint_pilot(saver, args, trainer, epoch, iteration, acc_str):
 
 def build_everything_from_args(args: arg_util.Args, saver):
     # Set default scale_schedule if not provided
-    if not hasattr(args, 'scale_schedule') or args.scale_schedule is None:
-        args.scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)  # Default from infinity.py
-        print(f"Setting default scale_schedule: {args.scale_schedule}")
+    # if not hasattr(args, 'scale_schedule') or args.scale_schedule is None:
+    #     args.scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)  # Default from infinity.py
+    #     print(f"Setting default scale_schedule: {args.scale_schedule}")
+    num_scales = args.always_training_scales
+    from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
+    # 使用 ratio=1.0 作為 placeholder
+    placeholder_scales = dynamic_resolution_h_w[1.0][args.pn]['scales'][:num_scales]
+
+    if getattr(args, 'task_type', 't2i') == 't2i':
+        args.scale_schedule = [(1, h, w) for (_, h, w) in placeholder_scales]
+    else:
+        args.scale_schedule = placeholder_scales
     
+    print(f"Setting placeholder scale_schedule (will be overridden during training): {args.scale_schedule}")
+
     # set seed
     args.set_initial_seed(benchmark=True)
     if args.seed is not None and not args.rand: # check the randomness
@@ -204,9 +215,9 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     del vae_ckpt
     
     # Set scale_schedule from args if not provided
-    if not hasattr(args, 'scale_schedule') or args.scale_schedule is None:
-        args.scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)  # Default from infinity.py
-        print(f"Setting default scale_schedule: {args.scale_schedule}")
+    # if not hasattr(args, 'scale_schedule') or args.scale_schedule is None:
+    #     args.scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)  # Default from infinity.py
+    #     print(f"Setting default scale_schedule: {args.scale_schedule}")
     
     # Load checkpoint for architecture detection if available - MUST BE BEFORE model dimension detection
     infinity_checkpoint = None
@@ -283,6 +294,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         # pretrained=False, global_pool='',
         vae_local=vae_local,
         text_channels=args.Ct5,
+        # norm_eps=args.norm_eps,
         text_maxlen=args.tlen,
         embed_dim=embed_dim,
         depth=depth,
