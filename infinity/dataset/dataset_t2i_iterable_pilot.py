@@ -272,8 +272,27 @@ class T2IIterableDataset(IterableDataset):
                     print(e)
             captions = [item[0] for item in batch_data]
             images = torch.stack([item[1] for item in batch_data])
-            condition_masks = torch.stack([item[2] for item in batch_data])
-            condition_normals = torch.stack([item[3] for item in batch_data])
+
+            mask_list = [item[2] for item in batch_data]
+            if all(m is None for m in mask_list):
+                condition_masks = None
+            elif any(m is None for m in mask_list):
+                ref = next(m for m in mask_list if m is not None)
+                filled = [torch.zeros_like(ref) if m is None else m for m in mask_list]
+                condition_masks = torch.stack(filled)
+            else:
+                condition_masks = torch.stack(mask_list)
+
+            normal_list = [item[3] for item in batch_data]
+            if all(n is None for n in normal_list):
+                condition_normals = None
+            elif any(n is None for n in normal_list):
+                ref_n = next(n for n in normal_list if n is not None)
+                filled_n = [torch.zeros_like(ref_n) if n is None else n for n in normal_list]
+                condition_normals = torch.stack(filled_n)
+            else:
+                condition_normals = torch.stack(normal_list)
+
             yield (images, condition_masks, condition_normals, captions)
             del batch_data
             del images
@@ -331,15 +350,14 @@ class T2IIterableDataset(IterableDataset):
 
     def prepare_model_input(self, data_item) -> Tuple:
         img_path, h_div_w = data_item['image_path'], data_item['h_div_w'] # for extra input "image pth 2"
-        mask_path = img_path.replace('images', 'normal_mask') # legacy text mask
-        # mask_path = mask_path.replace('jpg', 'png')
-        normal_path = img_path.replace('images', 'normals')
-        # normal_path = data_item.get('normal_map_path', None)
+        mask_path = data_item.get('normal_path', None)
+        normal_path = data_item.get('normal_map_path', None)
         long_text_input = data_item['long_caption']
         long_text_type = data_item.get('long_caption_type', 'user_prompt')
         text_input = self.get_text_input(long_text_input, None, long_text_type)
         text_input = process_short_text(text_input)
-
+        condition_mask_B3HW = None
+        condition_normal_B3HW = None
         h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w - h_div_w_templates))]
         try:
             if self.load_vae_instead_of_image:      # Set to False
@@ -355,14 +373,17 @@ class T2IIterableDataset(IterableDataset):
                     tgt_h, tgt_w = dynamic_resolution_h_w[np.float64(1.0)][self.pn]['pixel']
                     img_B3HW = transform(img, tgt_h, tgt_w)
                 # 處理條件圖像 modified
-                with open(mask_path, 'rb') as f:
-                    mask_img: PImage.Image = PImage.open(f)
-                    mask_img = mask_img.convert('RGB')
-                    condition_mask_B3HW = transform(mask_img, tgt_h, tgt_w)
-                with open(normal_path, 'rb') as f:
-                    normal_img: PImage.Image = PImage.open(f)
-                    normal_img = normal_img.convert('RGB')
-                    condition_normal_B3HW = transform(normal_img, tgt_h, tgt_w)
+                if mask_path is not None and osp.exists(mask_path):
+                    with open(mask_path, 'rb') as f:
+                        mask_img: PImage.Image = PImage.open(f)
+                        mask_img = mask_img.convert('RGB')
+                        condition_mask_B3HW = transform(mask_img, tgt_h, tgt_w)
+                condition_normal_B3HW = None
+                if normal_path is not None and osp.exists(normal_path):
+                    with open(normal_path, 'rb') as f:
+                        normal_img: PImage.Image = PImage.open(f)
+                        normal_img = normal_img.convert('RGB')
+                        condition_normal_B3HW = transform(normal_img, tgt_h, tgt_w)
             if not self.online_t5:
                 short_t5_path, long_t5_path = self.get_t5_path(img_path)
                 if self.epoch_global_worker_generator.random() <= self.short_prob:

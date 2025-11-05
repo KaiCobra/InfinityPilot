@@ -101,20 +101,9 @@ def save_checkpoint_pilot(saver, args, trainer, epoch, iteration, acc_str):
 
 def build_everything_from_args(args: arg_util.Args, saver):
     # Set default scale_schedule if not provided
-    # if not hasattr(args, 'scale_schedule') or args.scale_schedule is None:
-    #     args.scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)  # Default from infinity.py
-    #     print(f"Setting default scale_schedule: {args.scale_schedule}")
-    num_scales = args.always_training_scales
-    from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
-    # 使用 ratio=1.0 作為 placeholder
-    placeholder_scales = dynamic_resolution_h_w[1.0][args.pn]['scales'][:num_scales]
-
-    if getattr(args, 'task_type', 't2i') == 't2i':
-        args.scale_schedule = [(1, h, w) for (_, h, w) in placeholder_scales]
-    else:
-        args.scale_schedule = placeholder_scales
-    
-    print(f"Setting placeholder scale_schedule (will be overridden during training): {args.scale_schedule}")
+    if not hasattr(args, 'scale_schedule') or args.scale_schedule is None:
+        args.scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)  # Default from infinity.py
+        print(f"Setting default scale_schedule: {args.scale_schedule}")
 
     # set seed
     args.set_initial_seed(benchmark=True)
@@ -401,9 +390,40 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     gpt_kw['special_car_init'] = getattr(args, 'special_car_init', None)
     if gpt_kw['car_resume_path'] is not None and gpt_kw['car_resume_path'] != '' and gpt_kw['car_resume_path'].lower() != 'none':
         print(f"Resuming CAR weights from: {gpt_kw['car_resume_path']}")
-        car_ckpt = torch.load(gpt_kw['car_resume_path'], map_location='cpu')
-        gpt_wo_ddp.load_car_weights(car_ckpt)
-        del car_ckpt
+        raw_ckpt = torch.load(gpt_kw['car_resume_path'], map_location='cpu', weights_only=False)
+
+        def _extract_car_state(blob: dict) -> Optional[dict]:
+            if not isinstance(blob, dict):
+                return None
+            preferred_keys = (
+                'car_wo_ddp',
+                'car_state',
+                'car_fsdp',
+                'car_ema_fsdp',
+            )
+            for key in preferred_keys:
+                if key in blob and blob[key]:
+                    return blob[key]
+            subset = {k: v for k, v in blob.items() if any(k.startswith(prefix) for prefix in ('car_', 'control_'))}
+            return subset if subset else None
+
+        car_state = _extract_car_state(raw_ckpt)
+        if car_state is None and isinstance(raw_ckpt, dict):
+            car_state = _extract_car_state(raw_ckpt.get('trainer', {}))
+
+        if car_state is None:
+            raise RuntimeError(
+                "Provided CAR resume checkpoint does not contain recognizable car_* weights: "
+                f"{gpt_kw['car_resume_path']}"
+            )
+
+        if any('._fsdp_wrapped_module.' in k for k in car_state.keys()):
+            print('[car-resume] Detected FSDP-format CAR weights; converting to standard format...')
+            car_state = gpt_wo_ddp._convert_fsdp_to_standard_format(car_state)
+            car_state = {k: v for k, v in car_state.items() if any(k.startswith(prefix) for prefix in ('car_', 'control_'))}
+
+        gpt_wo_ddp.load_car_weights(car_state)
+        del raw_ckpt
         torch.cuda.empty_cache()
     else:
         # Use default CAR initialization (simple Xavier)
@@ -687,7 +707,8 @@ def main_train(args: arg_util.Args):
         
         # [save checkpoint]
         save_car_epoch_freq = getattr(args, 'save_car_epoch_freq', 1)  # 預設值為 1
-        if dist.is_master() and ep != 0 and ep % save_car_epoch_freq == 0:
+        save_car_step_freq = getattr(args, 'save_car_step_freq', 0)
+        if save_car_step_freq <= 0 and save_car_epoch_freq > 0 and dist.is_master() and ep != 0 and ep % save_car_epoch_freq == 0:
             with misc.Low_GPU_usage(files=[args.log_txt_path], sleep_secs=3, verbose=True):
             # 使用我們的 save_checkpoint_pilot 函數
                 save_checkpoint_pilot(
@@ -842,6 +863,7 @@ def train_one_ep(
         [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.2f} ({global_avg:.2f})')) for x in ['tnm']]
         [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Lm', 'Lt']]
         [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.2f} ({global_avg:.2f})')) for x in ['Accm', 'Acct']]
+        me.add_meter('tsc', misc.SmoothedValue(window_size=1, fmt='{median:.0f} ({global_avg:.0f})'))
         # ============================================= iteration loop begins =============================================
         for it, data in me.log_every(start_it, iters_train, ld_or_itrt, args.log_freq, args.log_every_iter, header):
             g_it = ep * iters_train + it
@@ -902,50 +924,50 @@ def train_one_ep(
                     condition_mask = None
                 if condition_mask is not None:
                     condition_inputs['mask'] = condition_mask
-                if not condition_inputs:
-                    condition_inputs = None
-                # if it > start_it + 10:
-                #     telling_dont_kill.early_stop()
-                
-                # [logging]
-                args.cur_it = f'{it+1}/{iters_train}'
-                args.last_wei_g = me.meters['tnm'].median
-                if dist.is_local_master() and (it >= start_it + 10) and (time.time() - last_touch > 90):
-                    _, args.remain_time, args.finish_time = me.iter_time.time_preds(max_it - g_it + (args.ep - ep) * 15)      # +15: other cost
-                    args.dump_log()
-                    last_touch = time.time()
+            if not condition_inputs:
+                condition_inputs = None
 
-                # [schedule learning rate]
-                wp_it = max(int(args.wp * iters_train), args.min_warmup_iters)
-                min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(args.sche, trainer.gpt_opt.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe)
-                
-                # 檢查學習率是否異常
-                if not math.isfinite(max_tlr) or max_tlr <= 0 or max_tlr > 1:
-                    print(f"[ERROR] Abnormal learning rate: {max_tlr}")
-                    raise RuntimeError(f"Abnormal learning rate: {max_tlr}")
-                
-                if max_tlr > 1e-2:  # 學習率過大警告
-                    print(f"[WARNING] Large learning rate detected: {max_tlr}")
+            # [logging]
+            args.cur_it = f'{it+1}/{iters_train}'
+            args.last_wei_g = me.meters['tnm'].median
+            if dist.is_local_master() and (it >= start_it + 10) and (time.time() - last_touch > 90):
+                _, args.remain_time, args.finish_time = me.iter_time.time_preds(max_it - g_it + (args.ep - ep) * 15)      # +15: other cost
+                args.dump_log()
+                last_touch = time.time()
 
-                # 只在記錄頻率時記錄到 wandb，避免步驟衝突
-                if dist.is_master() and (it % args.log_freq == 0 or it == 0):
-                    log_metrics({
-                        'train/loss_mean': me.meters['Lm'].median,
-                        'train/loss_tail': me.meters['Lt'].median,
-                        'train/acc_mean': me.meters['Accm'].median,
-                        'train/acc_tail': me.meters['Acct'].median,
-                        'train/learning_rate': max_tlr,
-                        'train/grad_norm': me.meters['tnm'].median,
-                        'train/epoch': ep,
-                        'train/iter': g_it,
-                    }, step=g_it)
-                
-                # [get scheduled hyperparameters]
-                progress = g_it / (max_it - 1)
-                clip_decay_ratio = (0.3 ** (20 * progress) + 0.2) if args.cdec else 1
-                
-                stepping = (g_it + 1) % args.ac == 0
-                step_cnt += int(stepping)
+            # [schedule learning rate]
+            wp_it = max(int(args.wp * iters_train), args.min_warmup_iters)
+            min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(args.sche, trainer.gpt_opt.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe)
+            
+            # 檢查學習率是否異常
+            if not math.isfinite(max_tlr) or max_tlr <= 0 or max_tlr > 1:
+                print(f"[ERROR] Abnormal learning rate: {max_tlr}")
+                raise RuntimeError(f"Abnormal learning rate: {max_tlr}")
+            
+            if max_tlr > 1e-2:  # 學習率過大警告
+                print(f"[WARNING] Large learning rate detected: {max_tlr}")
+
+            # 只在記錄頻率時記錄到 wandb，避免步驟衝突
+            if dist.is_master() and (it % args.log_freq == 0 or it == 0):
+                current_scale_for_log = trainer.last_training_scales if getattr(trainer, 'last_training_scales', 0) else args.always_training_scales
+                log_metrics({
+                    'train/loss_mean': me.meters['Lm'].median,
+                    'train/loss_tail': me.meters['Lt'].median,
+                    'train/acc_mean': me.meters['Accm'].median,
+                    'train/acc_tail': me.meters['Acct'].median,
+                    'train/learning_rate': max_tlr,
+                    'train/grad_norm': me.meters['tnm'].median,
+                    'train/epoch': ep,
+                    'train/iter': g_it,
+                    'train/training_scales': current_scale_for_log,
+                }, step=g_it)
+            
+            # [get scheduled hyperparameters]
+            progress = g_it / (max_it - 1)
+            clip_decay_ratio = (0.3 ** (20 * progress) + 0.2) if args.cdec else 1
+            
+            stepping = (g_it + 1) % args.ac == 0
+            step_cnt += int(stepping)
             
             with maybe_record_function('in_training'):
                 grad_norm_t, scale_log2_t = trainer.train_step(
@@ -957,9 +979,31 @@ def train_one_ep(
                     text_cond_tuple=text_cond_tuple,
                     args=args,
                 )
-            
+            scale_update = trainer.maybe_update_training_scales(g_it=g_it, args=args)
             with maybe_record_function('after_train'):
-                me.update(tlr=max_tlr)
+                current_scale = trainer.last_training_scales if getattr(trainer, 'last_training_scales', 0) else args.always_training_scales
+                me.update(tlr=max_tlr, tsc=current_scale)
+            if scale_update is not None and dist.is_master():
+                print(f"[DynamicScale] Increased training scales to {scale_update} at global step {g_it}.")
+                log_metrics({'train/training_scales': scale_update}, step=g_it)
+
+            save_car_step_freq = getattr(args, 'save_car_step_freq', 0)
+            if save_car_step_freq > 0 and dist.is_master() and (g_it + 1) % save_car_step_freq == 0:
+                acc_str = (
+                    f"Lm:{me.meters['Lm'].global_avg:.3f}_"
+                    f"Lt:{me.meters['Lt'].global_avg:.3f}_"
+                    f"Am:{me.meters['Accm'].global_avg:.2f}_"
+                    f"At:{me.meters['Acct'].global_avg:.2f}"
+                )
+                with misc.Low_GPU_usage(files=[args.log_txt_path], sleep_secs=3, verbose=True):
+                    save_checkpoint_pilot(
+                        saver=saver,
+                        args=args,
+                        trainer=trainer,
+                        epoch=ep,
+                        iteration=g_it + 1,
+                        acc_str=acc_str,
+                    )
 
     # ============================================= iteration loop ends =============================================
     

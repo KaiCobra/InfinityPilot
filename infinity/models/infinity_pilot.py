@@ -238,8 +238,8 @@ class InfinityPilot(Infinity):
                                  if not self._is_car_parameter(name)}
         source_infinity_params = set(filtered_dict.keys())
 
-        sorted_source_infinity_params = sorted(source_infinity_params)
-        sorted_current_infinity_params = sorted(current_infinity_params)
+        # sorted_source_infinity_params = sorted(source_infinity_params)
+        # sorted_current_infinity_params = sorted(current_infinity_params)
 
         # 調試信息：檢查哪些參數缺失
         missing_in_target = source_infinity_params - current_infinity_params
@@ -524,7 +524,7 @@ class InfinityPilot(Infinity):
         dpr = [x.item() for x in torch.linspace(0, init_kwargs.get('drop_path_rate', 0.0), self.car_depth)]
 
         self.car_control_proj = nn.Linear(self.d_vae, self.C)
-        nn.init.zeros_(self.car_control_proj.weight)
+        nn.init.xavier_uniform_(self.car_control_proj.weight)
         if self.car_control_proj.bias is not None:
             nn.init.zeros_(self.car_control_proj.bias)
 
@@ -550,6 +550,13 @@ class InfinityPilot(Infinity):
             # nn.LayerNorm(self.C, eps=init_kwargs.get('norm_eps', 1e-4))
             for _ in range(self.car_depth)
         ])
+        
+        for norm in self.car_fusion_norms:
+            if isinstance(norm, nn.LayerNorm) or isinstance(norm, FP32_Layernorm):
+                nn.init.ones_(norm.weight)
+                nn.init.zeros_(norm.bias)
+            elif isinstance(norm, FastRMSNorm):
+                nn.init.ones_(norm.weight)
 
         self.car_fusion_linears = nn.ModuleList([
             nn.Linear(2 * self.C, self.C)
@@ -557,7 +564,7 @@ class InfinityPilot(Infinity):
         ])
 
         for linear in self.car_fusion_linears:
-            nn.init.zeros_(linear.weight)
+            nn.init.xavier_uniform_(linear.weight)
             if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
 
@@ -606,11 +613,171 @@ class InfinityPilot(Infinity):
                 'proj': tok
             })
 
-        # [Debug delete later]
-        if torch.isnan(tokens).any() or torch.isinf(tokens).any():
-            raise ValueError(f"NaN or Inf detected in control tokens at scale {scale_idx}")
-
         return per_scale
+
+    def _prepare_car_fusion_map(
+        self,
+        cond_BD_or_gss: torch.Tensor,
+        scale_schedule: List[Tuple[int, int, int]],
+        control_scale_info: Optional[List[Optional[Dict[str, Any]]]],
+        seq_len: int,
+        *,
+        pad_to_multiplier: int = 0,
+    ) -> Dict[int, Tuple[int, torch.Tensor]]:
+        """
+        Build the CAR fusion tensors for each transformer block so that forward
+        and autoregressive inference can share the same control logic.
+        """
+        if control_scale_info is None or not control_scale_info or not self.has_car_modules():
+            return {}
+
+        bs = cond_BD_or_gss.shape[0]
+        device = cond_BD_or_gss.device
+        dtype = cond_BD_or_gss.dtype
+
+        scale_token_lengths = [int(np.prod(pn)) for pn in scale_schedule]
+        total_tokens = 1 + sum(scale_token_lengths)
+
+        if seq_len < total_tokens:
+            raise ValueError(f"seq_len ({seq_len}) must cover all scheduled tokens ({total_tokens})")
+
+        scale_offsets = []
+        ptr = 1  # skip SOS token
+        for length in scale_token_lengths:
+            scale_offsets.append((ptr, ptr + length))
+            ptr += length
+
+        car_layer_outputs: List[List[torch.Tensor]] = [[] for _ in range(self.car_depth)]
+
+        for scale_idx, pn in enumerate(scale_schedule):
+            scale_len = int(np.prod(pn))
+            info = None
+            if control_scale_info and scale_idx < len(control_scale_info):
+                info = control_scale_info[scale_idx]
+
+            if info is None:
+                zero_feat = cond_BD_or_gss.new_zeros(bs, scale_len, self.C)
+                for layer_outputs in car_layer_outputs:
+                    layer_outputs.append(zero_feat)
+                continue
+
+            proj = info['proj']  # shape (B_ctrl, L, C)
+            kv_compact, cu_seqlens_k, max_seqlen_k = info['kv']
+
+            ctrl_bs, ctrl_len, _ = proj.shape
+            repeat_factor = 1
+            if ctrl_bs != bs:
+                if bs % ctrl_bs != 0:
+                    raise ValueError(f"Control tokens batch {ctrl_bs} cannot match inference batch {bs}")
+                repeat_factor = bs // ctrl_bs
+                proj = proj.repeat(repeat_factor, 1, 1)
+                kv_shape = kv_compact.shape[-1]
+                kv_compact = kv_compact.view(ctrl_bs, max_seqlen_k, kv_shape).repeat(repeat_factor, 1, 1)
+                kv_compact = kv_compact.view(bs * max_seqlen_k, kv_shape).contiguous()
+                cu_seqlens_k = torch.arange(0, (bs + 1) * max_seqlen_k, max_seqlen_k, dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device)
+
+            car_attn_fn = None
+            car_attn_bias = None
+            need_to_pad_car = 0
+            single_scale_schedule = (pn,)
+
+            if self.use_flex_attn:
+                need_to_pad_car = (ctrl_len + pad_to_multiplier - 1) // pad_to_multiplier * pad_to_multiplier - ctrl_len if pad_to_multiplier else 0
+                if need_to_pad_car > 0:
+                    proj = F.pad(proj, (0, 0, 0, need_to_pad_car))
+
+                car_attn_fn = self.attn_fn_compile_dict.get(single_scale_schedule, None)
+                if car_attn_fn is None:
+                    car_attn_fn = FlexAttn(
+                        block_scales=single_scale_schedule,
+                        mask_type='var',
+                        B=proj.shape[0],
+                        H=self.num_heads,
+                        L=proj.shape[1],
+                        auto_padding=False
+                    )
+            else:
+                causal_mask = torch.triu(
+                    torch.ones(ctrl_len, ctrl_len, device=proj.device, dtype=torch.bool),
+                    diagonal=1
+                )
+                car_attn_bias = torch.zeros(1, 1, ctrl_len, ctrl_len, device=proj.device, dtype=torch.float32)
+                car_attn_bias.masked_fill_(causal_mask, float('-inf'))
+
+            for layer_idx, car_block in enumerate(self.car_blocks):
+                with torch.amp.autocast('cuda', enabled=False):
+                    h_fp32 = proj.float()
+                    kv_fp32 = kv_compact.float()
+                    ca_kv_fp32 = (kv_fp32, cu_seqlens_k, max_seqlen_k)
+                    h_out = car_block(
+                        x=h_fp32,
+                        cond_BD=cond_BD_or_gss,
+                        ca_kv=ca_kv_fp32,
+                        attn_bias_or_two_vector=car_attn_bias,
+                        attn_fn=car_attn_fn,
+                        scale_schedule=scale_schedule,
+                        rope2d_freqs_grid=self.rope2d_freqs_grid,
+                        scale_ind=scale_idx,
+                    )
+                if need_to_pad_car > 0:
+                    h_out = h_out[:, :ctrl_len, :]
+                h_out = h_out.to(dtype)
+                self._assert_finite(f"car_block[{layer_idx}] scale {scale_idx}", h_out)
+                car_layer_outputs[layer_idx].append(h_out)
+
+        car_layer_full_outputs: List[Optional[torch.Tensor]] = []
+        for layer_outputs in car_layer_outputs:
+            if not layer_outputs:
+                car_layer_full_outputs.append(None)
+                continue
+            padded_segments = []
+            for (start, end), output in zip(scale_offsets, layer_outputs):
+                pad_left = start
+                pad_right = seq_len - end
+                padded = F.pad(output, (0, 0, pad_left, pad_right))
+                padded_segments.append(padded)
+            full = torch.stack(padded_segments, dim=0).sum(dim=0)
+            self._assert_finite("car_full_scale_feature", full)
+            car_layer_full_outputs.append(full)
+
+        fusion_map: Dict[int, Tuple[int, torch.Tensor]] = {}
+        active_layers = [(idx, tensor) for idx, tensor in enumerate(car_layer_full_outputs) if tensor is not None]
+        if active_layers:
+            active_count = min(len(active_layers), len(self.blocks))
+            active_layers = active_layers[:active_count]
+            forward_connection = False
+            if forward_connection:
+                target_blocks = list(range(len(self.blocks) - 1, len(self.blocks) - active_count - 1, -1))
+                for block_idx, (car_idx, tensor) in zip(target_blocks, active_layers):
+                    fusion_map[block_idx] = (car_idx, tensor.contiguous())
+            else:
+                target_blocks = list(range(len(self.blocks) - active_count, len(self.blocks)))
+                for block_idx, (car_idx, tensor) in zip(target_blocks, reversed(active_layers)):
+                    fusion_map[block_idx] = (car_idx, tensor.contiguous())
+
+        return fusion_map
+
+    def _make_car_fusion_hook(self, fusion_map: Dict[int, Tuple[int, torch.Tensor]]):
+        if not fusion_map or getattr(self, "disable_car_fusion", False):
+            return lambda _idx, seq: seq
+
+        def _apply(block_index: int, seq: torch.Tensor) -> torch.Tensor:
+            self._assert_finite(f"infinity_block[{block_index}] pre_fusion", seq)
+            entry = fusion_map.get(block_index, None)
+            if entry is None:
+                return seq
+            car_idx, car_feat = entry
+            if car_feat.size(1) < seq.size(1):
+                raise ValueError(f"CAR feature length {car_feat.size(1)} shorter than sequence {seq.size(1)}")
+            car_slice = car_feat[:, :seq.size(1), :].to(seq.dtype)
+            seq_with_car = torch.cat([seq.detach(), car_slice], dim=-1)
+            seq_with_car = self.car_fusion_norms[car_idx](seq_with_car)
+            fusion_delta = self.car_fusion_linears[car_idx](seq_with_car)
+            fused = seq + fusion_delta
+            self._assert_finite(f"infinity_block[{block_index}] post_fusion", fused)
+            return fused
+
+        return _apply
     
     def init_car_modules_if_needed(self):
         """如果尚未初始化則初始化 CAR 模塊"""
@@ -627,6 +794,41 @@ class InfinityPilot(Infinity):
             print("CAR modules not initialized, initializing now...")
             self._init_car_modules()
         
+        # 規範 FSDP / module 前綴，確保鍵與當前模型一致
+        if any(key.startswith('block_chunks.') for key in car_state_dict.keys()):
+            print('[INFO] Detected FSDP block_chunks format for CAR weights, converting...')
+            converted = {}
+            for key, value in car_state_dict.items():
+                if key.startswith('block_chunks.'):
+                    parts = key.split('.')
+                    if len(parts) >= 4 and parts[2] == 'module':
+                        rest_path = '.'.join(parts[4:])
+                        if rest_path:
+                            converted[rest_path] = value
+                            continue
+                converted[key] = value
+            car_state_dict = converted
+
+        if any('._fsdp_wrapped_module.' in key or key.startswith('module.') for key in car_state_dict.keys()):
+            print('[INFO] Detected FSDP-wrapped CAR weights, normalizing key prefixes...')
+
+        normalized_state = {}
+        for key, value in car_state_dict.items():
+            normalized_key = None
+            for marker in ('car_', 'control_'):
+                idx = key.find(marker)
+                if idx != -1:
+                    normalized_key = key[idx:]
+                    break
+            if normalized_key is None:
+                continue
+            if normalized_key in normalized_state:
+                print(f"[WARN] Duplicate CAR key after normalization: {normalized_key}, keeping latest copy")
+            normalized_state[normalized_key] = value
+
+        if normalized_state:
+            car_state_dict = normalized_state
+
         # 篩選出 CAR 相關的參數
         car_params = {}
         current_state_dict = self.state_dict()
@@ -766,92 +968,15 @@ class InfinityPilot(Infinity):
         else:
             attn_fn = None
 
-        scale_token_lengths = [int(np.prod(pn)) for pn in scale_schedule]
-        scale_offsets = []
-        ptr = 1  # skip SOS token
-        for length in scale_token_lengths:
-            scale_offsets.append((ptr, ptr + length))
-            ptr += length
-
         control_scale_info = self._build_control_ca_kv(control_tokens, scale_schedule)
-        car_layer_outputs: List[List[torch.Tensor]] = [[] for _ in range(self.car_depth)]
-        if control_scale_info:
-            for scale_idx, (start, end) in enumerate(scale_offsets):
-                info = control_scale_info[scale_idx] if scale_idx < len(control_scale_info) else None
-                x_scale = x_BLC[:, start:end, :].clone()
-                if info is None:
-                    zero_feat = x_scale.new_zeros(x_scale.shape)
-                    for layer_outputs in car_layer_outputs:
-                        layer_outputs.append(zero_feat.clone())
-                    continue
-                h = x_scale
-                for layer_idx, car_block in enumerate(self.car_blocks):
-                    with torch.amp.autocast('cuda', enabled=False):
-                        h_fp32 = h.float()
-                        current_ca_kv = info['kv']
-
-                        kv_compact_fp32 = current_ca_kv[0].float()
-                        cu_seqlens_k_fp32 = current_ca_kv[1]
-                        max_seqlen_k_fp32 = current_ca_kv[2]
-
-                        ca_kv_fp32 = (kv_compact_fp32, cu_seqlens_k_fp32, max_seqlen_k_fp32)
-                        h_output_fp32  = car_block(
-                            x=h_fp32,
-                            cond_BD=cond_BD_or_gss,
-                            ca_kv=ca_kv_fp32,
-                            attn_bias_or_two_vector=None,
-                            attn_fn=None,
-                            scale_schedule=scale_schedule,
-                            rope2d_freqs_grid=self.rope2d_freqs_grid,
-                            scale_ind=scale_idx,
-                        )
-                        h = h_output_fp32.to(h.dtype)
-                    self._assert_finite(f"car_block[{layer_idx}] scale {scale_idx}", h)
-                    car_layer_outputs[layer_idx].append(h)
-
-        car_layer_full_outputs: List[Optional[torch.Tensor]] = []
-        for layer_outputs in car_layer_outputs:
-            if not layer_outputs:
-                car_layer_full_outputs.append(None)
-                continue
-            full = x_BLC.new_zeros(x_BLC.size(0), x_BLC.size(1), x_BLC.size(2))
-            for (start, end), output in zip(scale_offsets, layer_outputs):
-                full[:, start:end, :] = output.to(full.dtype)
-                self._assert_finite("car_full_scale_feature", full[:, start:end, :])
-            car_layer_full_outputs.append(full)
-
-        fusion_map: Dict[int, Tuple[int, torch.Tensor]] = {}
-        active_layers = [(idx, tensor) for idx, tensor in enumerate(car_layer_full_outputs) if tensor is not None]
-        if active_layers:
-            active_count = min(len(active_layers), len(self.blocks))
-            active_layers = active_layers[:active_count]
-            target_blocks = list(range(len(self.blocks) - 1, len(self.blocks) - active_count - 1, -1))
-            for block_idx, (car_idx, tensor) in zip(target_blocks, active_layers):
-                fusion_map[block_idx] = (car_idx, tensor.contiguous())
-
-        def _apply_car_fusion(block_index: int, seq: torch.Tensor) -> torch.Tensor:
-            if getattr(self, "disable_car_fusion", False):
-                return seq
-            self._assert_finite(f"infinity_block[{block_index}] pre_fusion", seq)
-            # seq = torch.nan_to_num(seq)
-
-            entry = fusion_map.get(block_index, None) # ablasion study
-            if entry is None:
-                return seq
-            car_idx, car_feat = entry
-            # car_feat = self.car_output_norms[car_idx](car_feat)
-
-            # ====================== CAR fusion ======================
-            # fusion = self.car_fusion_linears[car_idx](car_feat).to(seq.dtype)
-            # fusion = fusion * torch.clamp(F.softplus(self.car_fusion_scales[car_idx]), max=1.0)
-            # seq = seq + fusion
-            # ==================== CAR cat fusion ====================
-            seq_with_car = torch.cat([seq, car_feat], dim=-1) # 1. 串接
-            seq_with_car = self.car_fusion_norms[car_idx](seq_with_car) # 2. LayerNorm
-            fusion_delta = self.car_fusion_linears[car_idx](seq_with_car) # 3. 線性投影
-            seq = seq + fusion_delta # 4. 殘差連接
-
-            return seq
+        fusion_map = self._prepare_car_fusion_map(
+            cond_BD_or_gss=cond_BD_or_gss,
+            scale_schedule=scale_schedule,
+            control_scale_info=control_scale_info,
+            seq_len=x_BLC.size(1),
+            pad_to_multiplier=self.pad_to_multiplier if self.use_flex_attn else 0,
+        )
+        _apply_car_fusion = self._make_car_fusion_hook(fusion_map)
 
         # [2. block loop] - 修改以支援控制條件
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training
@@ -961,7 +1086,20 @@ class InfinityPilot(Infinity):
         idx_Bl_list, idx_Bld_list = [], []
         
         control_scale_info = self._build_control_ca_kv(control_tokens, scale_schedule)
-        
+        total_seq_tokens = 1 + sum(int(np.prod(pn)) for pn in scale_schedule)
+        if self.use_flex_attn and self.pad_to_multiplier:
+            seq_len_for_car = ((total_seq_tokens + self.pad_to_multiplier - 1) // self.pad_to_multiplier) * self.pad_to_multiplier
+        else:
+            seq_len_for_car = total_seq_tokens
+        fusion_map = self._prepare_car_fusion_map(
+            cond_BD_or_gss=cond_BD_or_gss,
+            scale_schedule=scale_schedule,
+            control_scale_info=control_scale_info,
+            seq_len=seq_len_for_car,
+            pad_to_multiplier=self.pad_to_multiplier if self.use_flex_attn else 0,
+        )
+        apply_car = self._make_car_fusion_hook(fusion_map)
+
         # define model blocks
         if inference_mode:
             for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
@@ -995,9 +1133,6 @@ class InfinityPilot(Infinity):
         num_stages_minus_1 = len(scale_schedule)-1
         summed_codes = 0
         
-        # 初始化控制分支的輸入
-        next_control_token_map = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
-        
         for si, pn in enumerate(scale_schedule):   # si: i-th segment
             cfg = cfg_list[si]
             if si >= trunk_scale:
@@ -1013,6 +1148,7 @@ class InfinityPilot(Infinity):
 
             # 主分支處理
             layer_idx = 0
+            global_block_idx = 0
             for block_idx, b in enumerate(self.block_chunks):
                 if self.add_lvl_embeding_only_first_block and block_idx == 0:
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
@@ -1026,6 +1162,8 @@ class InfinityPilot(Infinity):
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
                         last_stage = torch.cat((last_stage, last_stage), 0)
+                    last_stage = apply_car(global_block_idx, last_stage)
+                    global_block_idx += 1
                     layer_idx += 1
             
             if (cfg != 1) and add_cfg_on_logits: # True
@@ -1083,8 +1221,6 @@ class InfinityPilot(Infinity):
             if si != num_stages_minus_1:
                 last_stage = self.word_embed(self.norm0_ve(last_stage))
                 last_stage = last_stage.repeat(bs//B, 1, 1)
-                # 同時更新控制分支的輸入
-                next_control_token_map = last_stage
 
         if inference_mode:
             for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)

@@ -5,7 +5,7 @@ import os.path as osp
 from functools import partial
 from pprint import pformat
 from typing import List, Optional, Tuple, Union, Dict
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import seaborn as sns
 import torch
@@ -63,6 +63,84 @@ BTen = torch.BoolTensor
 fullstate_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 fulloptstate_save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
+class DynamicScaleManager:
+    def __init__(
+        self,
+        initial_scale: int,
+        target_scale: int,
+        patience_low: int,
+        patience_high: int,
+        transition_scale: int,
+        loss_delta: float,
+        loss_window: int,
+    ) -> None:
+        self.current_scale = max(1, int(initial_scale))
+        self.target_scale = max(self.current_scale, int(target_scale))
+        self.patience_low = max(1, int(patience_low))
+        self.patience_high = max(1, int(patience_high))
+        self.transition_scale = int(transition_scale)
+        self.loss_delta = float(loss_delta)
+        self.loss_window = max(1, int(loss_window))
+        self.loss_buffer: deque = deque(maxlen=self.loss_window)
+        self.best_smoothed_loss = float('inf')
+        self.last_improvement_step = 0
+        self.last_scale_step = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.current_scale < self.target_scale
+
+    def get_current_limit(self) -> int:
+        return self.current_scale
+
+    def _current_patience(self) -> int:
+        return self.patience_low if self.current_scale < self.transition_scale else self.patience_high
+
+    def register_step(self, g_it: int, loss_value: float) -> Optional[int]:
+        if not self.enabled:
+            return None
+        self.loss_buffer.append(float(loss_value))
+        if len(self.loss_buffer) < self.loss_window:
+            return None
+        current_avg = sum(self.loss_buffer) / len(self.loss_buffer)
+        if current_avg < self.best_smoothed_loss - self.loss_delta:
+            self.best_smoothed_loss = current_avg
+            self.last_improvement_step = g_it
+        patience = self._current_patience()
+        if g_it - self.last_scale_step < patience:
+            return None
+        if g_it - self.last_improvement_step >= patience:
+            self.current_scale = min(self.target_scale, self.current_scale + 1)
+            self.last_scale_step = g_it
+            self.last_improvement_step = g_it
+            self.best_smoothed_loss = float('inf')
+            self.loss_buffer.clear()
+            return self.current_scale
+        return None
+
+    def get_state(self) -> Dict[str, Union[int, float, List[float]]]:
+        return {
+            'current_scale': self.current_scale,
+            'target_scale': self.target_scale,
+            'best_smoothed_loss': self.best_smoothed_loss,
+            'last_improvement_step': self.last_improvement_step,
+            'last_scale_step': self.last_scale_step,
+            'loss_buffer': list(self.loss_buffer),
+        }
+
+    def load_state(self, state: Optional[Dict[str, Union[int, float, List[float]]]]) -> None:
+        if not state:
+            return
+        self.current_scale = max(1, int(state.get('current_scale', self.current_scale)))
+        self.target_scale = max(self.current_scale, int(state.get('target_scale', self.target_scale)))
+        self.best_smoothed_loss = float(state.get('best_smoothed_loss', self.best_smoothed_loss))
+        self.last_improvement_step = int(state.get('last_improvement_step', self.last_improvement_step))
+        self.last_scale_step = int(state.get('last_scale_step', self.last_scale_step))
+        buffer_values = state.get('loss_buffer', [])
+        self.loss_buffer.clear()
+        for value in buffer_values[-self.loss_window:]:
+            self.loss_buffer.append(float(value))
+
 class InfinityPilotTrainer(object):
     def __init__(
         self, is_visualizer: bool, device, raw_scale_schedule: Tuple[int, ...],
@@ -73,6 +151,7 @@ class InfinityPilotTrainer(object):
     ):
         super(InfinityPilotTrainer, self).__init__()
         self.dbg_unused = dbg_unused
+        self._args_ref = other_args
         
         self.zero = zero
         self.vae_type = vae_type
@@ -93,6 +172,33 @@ class InfinityPilotTrainer(object):
         print(f'self.reweight_loss_by_scale: {self.reweight_loss_by_scale}')
         self.text_tokenizer = None
         self.text_encoder = None
+        self.last_train_loss: Optional[float] = None
+        base_scale_limit = getattr(other_args, 'always_training_scales', 1) if other_args is not None else 1
+        self.base_training_scale_limit = max(1, int(base_scale_limit))
+        initial_scales_cfg = getattr(other_args, 'initial_training_scales', 0) if other_args is not None else 0
+        if initial_scales_cfg is None or int(initial_scales_cfg) <= 0:
+            initial_scales_cfg = self.base_training_scale_limit
+        initial_scales = max(1, int(initial_scales_cfg))
+        initial_scales = min(initial_scales, self.base_training_scale_limit)
+        self.active_training_scales = initial_scales
+        self.last_training_scales = initial_scales
+        self.dynamic_scale_manager: Optional[DynamicScaleManager] = None
+        if other_args is not None and getattr(other_args, 'enable_dynamic_scales', False):
+            target_scale_cfg = getattr(other_args, 'dynamic_scale_target', self.base_training_scale_limit)
+            target_scale = max(1, int(target_scale_cfg)) if target_scale_cfg is not None else self.base_training_scale_limit
+            target_scale = min(target_scale, self.base_training_scale_limit)
+            target_scale = max(target_scale, self.active_training_scales)
+            patience_transition = getattr(other_args, 'dynamic_scale_patience_transition', target_scale)
+            patience_transition = max(1, int(patience_transition)) if patience_transition is not None else target_scale
+            self.dynamic_scale_manager = DynamicScaleManager(
+                initial_scale=self.active_training_scales,
+                target_scale=target_scale,
+                patience_low=getattr(other_args, 'dynamic_scale_patience_low', 3000),
+                patience_high=getattr(other_args, 'dynamic_scale_patience_high', 4000),
+                transition_scale=patience_transition,
+                loss_delta=getattr(other_args, 'dynamic_scale_loss_delta', 1e-3),
+                loss_window=getattr(other_args, 'dynamic_scale_loss_window', 200),
+            )
         
         # Ensure CAR modules are initialized
         gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
@@ -146,7 +252,7 @@ class InfinityPilotTrainer(object):
         self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='none')
         self.eq_loss = eq_loss
         
-        # For raw_scale_schedule computation
+        # For raw_scale_schedule computation        
         self.raw_scale_schedule = raw_scale_schedule
         self.raw_L = sum(pn * pn for pn in raw_scale_schedule)
         self.raw_last_l = raw_scale_schedule[-1] * raw_scale_schedule[-1]
@@ -507,11 +613,13 @@ class InfinityPilotTrainer(object):
                 if control_tokens_by_type:
                     full_control_tokens = self._combine_control_tokens(control_tokens_by_type, len(full_scale_schedule))
             
-            training_scales = min(args.always_training_scales, len(full_scale_schedule))
+            scale_limit = min(self.base_training_scale_limit, available_scales)
+            training_scales = min(scale_limit, self.active_training_scales)
+            if training_scales <= 0:
+                continue
+            self.last_training_scales = training_scales
             scale_schedule = full_scale_schedule[:training_scales]
             gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
-            if len(scale_schedule) == 0:
-                continue
             control_tokens = None
             if full_control_tokens is not None:
                 control_tokens = full_control_tokens[:training_scales]
@@ -623,7 +731,11 @@ class InfinityPilotTrainer(object):
                 if si < len(tokens_list):
                     tokens_at_scale.append(tokens_list[si])
             if tokens_at_scale:
-                control_tokens.append(torch.cat(tokens_at_scale, dim=1))
+                if len(tokens_at_scale) == 1:
+                    control_tokens.append(tokens_at_scale[0])
+                else:
+                    stacked = torch.stack(tokens_at_scale, dim=0)
+                    control_tokens.append(stacked.mean(dim=0))
             else:
                 control_tokens.append(None)
         return control_tokens
@@ -656,7 +768,7 @@ class InfinityPilotTrainer(object):
         V = self.vae_local.vocab_size
         device = inp_B3HW.device
         warmup_steps = self.logging_warmup_steps
-        should_visualize_batch = (it % 50 == 0 and dist.is_master())
+        should_visualize_batch = (it % 10 == 0 and dist.is_master())
         full_gt_ms_idx_Bl = None
 
         h_div_w = inp_B3HW.shape[-2] / inp_B3HW.shape[-1]
@@ -687,6 +799,7 @@ class InfinityPilotTrainer(object):
                 vae_scale_schedule = full_vae_scale_schedule
                 raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=vae_scale_schedule)
                 # take out normal map and text mask condition if exists
+                # print('condition_inputs:', condition_inputs)
                 if condition_inputs is not None:
                     if condition_inputs.get('mask') is not None:
                         condition_mask = condition_inputs.get('mask')
@@ -711,9 +824,11 @@ class InfinityPilotTrainer(object):
 
             # truncate scales
             available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl))
-            training_scales = min(args.always_training_scales, available_scales)
-            if training_scales == 0:
+            scale_limit = min(self.base_training_scale_limit, available_scales)
+            training_scales = min(scale_limit, self.active_training_scales)
+            if training_scales <= 0:
                 raise RuntimeError("No valid scales available; check VAE outputs or dynamic resolution settings.")
+            self.last_training_scales = training_scales
             scale_schedule = full_scale_schedule[:training_scales]
             gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
             control_tokens = None
@@ -755,6 +870,7 @@ class InfinityPilotTrainer(object):
                     it,
                     g_it,
                     inp_B3HW,
+                    raw_features,
                     condition_inputs,
                     gt_ms_idx_Bl,
                     pred_ms_idx_Bl,
@@ -799,8 +915,8 @@ class InfinityPilotTrainer(object):
                 lw = 1. / self.seq_len
                 weighted_loss = raw_loss * lw
 
-
             loss = weighted_loss.sum(dim=-1).mean()
+            self.last_train_loss = float(loss.detach().item())
 
         # [backward]
         # Check loss before backward
@@ -870,6 +986,8 @@ class InfinityPilotTrainer(object):
                         collect_grad_stats(f'FusionLinear_{i:02d}', linear_layer)
                 if hasattr(model_to_check, 'car_fusion_scales'):
                     collect_grad_stats('FusionScales', model_to_check.car_fusion_scales)
+                if hasattr(model_to_check, 'car_fusion_norms'):
+                    collect_grad_stats('FusionNorms', model_to_check.car_fusion_norms)
 
                 # 2. 如果收集到了數據，則繪圖並上傳
                 if grad_data:
@@ -1012,9 +1130,22 @@ class InfinityPilotTrainer(object):
             if grad_stats:
                 wandb_utils.log(grad_stats, step=g_it) # 使用全局步數 g_it
             wandb_utils.log(wandb_log_dict)
-        
+
         return grad_norm_t, scale_log2_t
-    
+
+    def maybe_update_training_scales(self, g_it: int, args: Optional[arg_util.Args] = None) -> Optional[int]:
+        if self.dynamic_scale_manager is None:
+            return None
+        if self.last_train_loss is None:
+            return None
+        new_scale = self.dynamic_scale_manager.register_step(g_it, self.last_train_loss)
+        if new_scale is None:
+            return None
+        clamped_scale = min(self.base_training_scale_limit, max(1, int(new_scale)))
+        self.active_training_scales = clamped_scale
+        self.last_training_scales = clamped_scale
+        return clamped_scale
+
     def __repr__(self):
         return (
             f'\n'
@@ -1049,12 +1180,15 @@ class InfinityPilotTrainer(object):
             print(f'[ema upd {self.ema_ratio}, cpu={self.ema_cpu}, @ g_it={g_it}] cost: {time.time()-stt:.2f}s')
     
     def get_config(self):
-        return {
+        config = {
             'dynamic_resolution_h_w': dynamic_resolution_h_w,
             'label_smooth': self.label_smooth, 'eq_loss': self.eq_loss,
             'ema_ratio':    self.ema_ratio,
             'prog_it':      self.prog_it, 'last_prog_si': self.last_prog_si, 'first_prog': self.first_prog,
         }
+        if self.dynamic_scale_manager is not None:
+            config['dynamic_scale_state'] = self.dynamic_scale_manager.get_state()
+        return config
     
     def state_dict(self):
         m = self.vae_local
@@ -1193,7 +1327,7 @@ class InfinityPilotTrainer(object):
                     self.gpt_opt.scaler.load_state_dict(state['gpt_opt_scaler'])
                 except Exception as e: 
                     print(f'[fp16 load_state_dict err] {e}')
-        
+            self.gpt._reset_lazy_init()
         else:  # DDP 模式
             # 載入完整的 state_dict
             if 'gpt_wo_ddp' in state:
@@ -1237,6 +1371,11 @@ class InfinityPilotTrainer(object):
         self.prog_it = config.get('prog_it', 0) if config else 0
         self.last_prog_si = config.get('last_prog_si', -1) if config else -1
         self.first_prog = config.get('first_prog', True) if config else True
+        if config is not None and self.dynamic_scale_manager is not None:
+            self.dynamic_scale_manager.load_state(config.get('dynamic_scale_state'))
+            restored_limit = min(self.base_training_scale_limit, self.dynamic_scale_manager.get_current_limit())
+            self.active_training_scales = max(1, int(restored_limit))
+            self.last_training_scales = self.active_training_scales
         
         if config is not None:
             for k, v in self.get_config().items():
@@ -1403,6 +1542,7 @@ class InfinityPilotTrainer(object):
         it: int,
         g_it: int,
         inp_B3HW: torch.Tensor,
+        raw_features_BdHW: torch.Tensor,
         condition_inputs: Optional[Dict[str, torch.Tensor]],
         gt_ms_idx_Bl: List[torch.Tensor],
         pred_ms_idx_Bl: List[torch.Tensor],
@@ -1423,7 +1563,7 @@ class InfinityPilotTrainer(object):
         try:
             return _generate_training_visualization(
                 self, ep, it, g_it, 
-                inp_B3HW, condition_inputs, 
+                inp_B3HW, raw_features_BdHW, condition_inputs, 
                 gt_ms_idx_Bl,
                 pred_ms_idx_Bl,
                 scale_schedule,

@@ -31,6 +31,7 @@ class Args(Tap):
     car_resume_path: str = ''           # pretrained CAR checkpoint (for InfinityPilot)
     special_car_init:str = ''           # special init method for CAR w/o pretrained weight: ['subset', 'interp', 'merge']
     save_car_epoch_freq: int = 1        # 每多少個 epoch 保存一次 CAR 權重
+    save_car_step_freq: int = 500       # 每多少個訓練 step 保存一次 CAR 權重 (<=0 表示停用)
     save_car_separately: bool = True    # 是否分別保存 CAR 權重
     nowd: int = 1                       # whether to disable weight decay on sparse params (like class token)
     enable_hybrid_shard: bool = False   # whether to use hybrid FSDP
@@ -162,6 +163,14 @@ class Args(Tap):
     add_lvl_embeding_only_first_block: int = 1 # apply lvl pe embedding only first block or each block
     reweight_loss_by_scale: int = 0     # reweight loss by scale
     always_training_scales: int = 100   # trunc training scales
+    initial_training_scales: int = 0    # starting number of training scales (<= always_training_scales, 0 means use always_training_scales)
+    enable_dynamic_scales: bool = True # dynamically increase training scales when loss plateaus
+    dynamic_scale_target: int = 13      # upper bound for dynamic training scales
+    dynamic_scale_patience_low: int = 10   # patience (steps) before adding scales below the transition scale
+    dynamic_scale_patience_high: int = 10  # patience (steps) before adding scales at/above the transition scale
+    dynamic_scale_patience_transition: int = 10  # switch point between low/high patience scheduling
+    dynamic_scale_loss_delta: float = 1e-3       # minimal smoothed loss improvement to reset patience
+    dynamic_scale_loss_window: int = 200         # moving window size for smoothed loss monitoring
     vae_type: int = 1                   # here 16/32/64 is bsq vae of different quant bits
     fake_vae_input: bool = False        # fake vae input for debug
     model_init_device: str = 'cuda'     # model_init_device
