@@ -8,24 +8,6 @@ import numpy as np
 import wandb
 from collections import defaultdict
 
-CONTROL_PARAM_FILTERS = (
-    'control_encoder',
-    'control_token_norm',
-    'control_scale_gate_mlp',
-    'control_scale_gate_bias',
-    'control_block_gates',
-    'car_control_encoder',
-    'car_control_norm',
-    'car_scale_gate_mlp',
-    'car_scale_gate_bias',
-    'car_block_fusion_gates',
-)
-CONTROL_NAME_PREFIXES = ('control_', 'car_')
-
-
-def _is_control_param(name: str) -> bool:
-    return name.startswith(CONTROL_NAME_PREFIXES)
-
 def log_parameter_stats_to_wandb(model, step, prefix="param_monitor"):
     """
     將參數統計信息記錄到 Wandb
@@ -37,13 +19,13 @@ def log_parameter_stats_to_wandb(model, step, prefix="param_monitor"):
     """
     
     # 分類參數
-    control_params = []
+    car_params = []
     infinity_params = []
     other_params = []
-
-    control_grad_norms = []
+    
+    car_grad_norms = []
     infinity_grad_norms = []
-    control_param_norms = []
+    car_param_norms = []
     infinity_param_norms = []
     
     frozen_with_grad_count = 0
@@ -53,15 +35,16 @@ def log_parameter_stats_to_wandb(model, step, prefix="param_monitor"):
         for name, param in model.named_parameters():
             param_norm = torch.norm(param).item()
             
-            if any(name.startswith(filter_prefix) for filter_prefix in CONTROL_PARAM_FILTERS):
-                control_params.append(name)
-                control_param_norms.append(param_norm)
-
+            # 分類參數
+            if any(car_prefix in name for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
+                car_params.append(name)
+                car_param_norms.append(param_norm)
+                
                 if param.grad is not None:
-                    control_grad_norms.append(torch.norm(param.grad).item())
+                    car_grad_norms.append(torch.norm(param.grad).item())
                 elif param.requires_grad:
                     trainable_without_grad_count += 1
-
+                    
             elif any(inf_prefix in name for inf_prefix in ['blocks', 'word_embed', 'pos_start', 'lvl_embed']):
                 infinity_params.append(name)
                 infinity_param_norms.append(param_norm)
@@ -75,20 +58,20 @@ def log_parameter_stats_to_wandb(model, step, prefix="param_monitor"):
     
     # 計算統計信息
     stats = {
-        f"{prefix}/control_param_count": len(control_params),
+        f"{prefix}/car_param_count": len(car_params),
         f"{prefix}/infinity_param_count": len(infinity_params),
         f"{prefix}/other_param_count": len(other_params),
-
-        f"{prefix}/control_avg_param_norm": np.mean(control_param_norms) if control_param_norms else 0,
+        
+        f"{prefix}/car_avg_param_norm": np.mean(car_param_norms) if car_param_norms else 0,
         f"{prefix}/infinity_avg_param_norm": np.mean(infinity_param_norms) if infinity_param_norms else 0,
-
-        f"{prefix}/control_avg_grad_norm": np.mean(control_grad_norms) if control_grad_norms else 0,
+        
+        f"{prefix}/car_avg_grad_norm": np.mean(car_grad_norms) if car_grad_norms else 0,
         f"{prefix}/infinity_avg_grad_norm": np.mean(infinity_grad_norms) if infinity_grad_norms else 0,
-
+        
         f"{prefix}/frozen_with_grad_count": frozen_with_grad_count,
         f"{prefix}/trainable_without_grad_count": trainable_without_grad_count,
-
-        f"{prefix}/control_grad_count": len(control_grad_norms),
+        
+        f"{prefix}/car_grad_count": len(car_grad_norms),
         f"{prefix}/infinity_grad_count": len(infinity_grad_norms),
     }
     
@@ -119,8 +102,8 @@ def create_parameter_change_table(model, baseline_params, step):
                 relative_change = diff / (param_norm + 1e-8)
                 
                 # 確定參數類型
-                if _is_control_param(name):
-                    param_type = "Control"
+                if any(car_prefix in name for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
+                    param_type = "CAR"
                 elif any(inf_prefix in name for inf_prefix in ['blocks', 'word_embed', 'pos_start']):
                     param_type = "Infinity"
                 else:
@@ -160,7 +143,7 @@ def log_freeze_violations_to_wandb(model, step, threshold=1e-8):
         if not param.requires_grad and param.grad is not None:
             grad_norm = torch.norm(param.grad).item()
             if grad_norm > threshold:
-                param_type = "Control" if _is_control_param(name) else ("Infinity" if any(x in name for x in ['blocks', 'word_embed']) else "Other")
+                param_type = "CAR" if "car_" in name else ("Infinity" if any(x in name for x in ['blocks', 'word_embed']) else "Other")
                 violations.append([
                     name.split('.')[-1][:30],
                     param_type,
@@ -170,7 +153,7 @@ def log_freeze_violations_to_wandb(model, step, threshold=1e-8):
         
         # 檢查可訓練參數是否沒有梯度
         elif param.requires_grad and param.grad is None:
-            param_type = "Control" if _is_control_param(name) else ("Infinity" if any(x in name for x in ['blocks', 'word_embed']) else "Other")
+            param_type = "CAR" if "car_" in name else ("Infinity" if any(x in name for x in ['blocks', 'word_embed']) else "Other")
             violations.append([
                 name.split('.')[-1][:30],
                 param_type,

@@ -35,7 +35,7 @@ torchrun \
     --tblr=5e-4 \
     --pn=1M \
     --model=2bc8 \
-    --lbs=6 \
+    --lbs=1 \
     --workers=1 \
     --short_cap_prob=0.0 \
     --online_t5=1 \
@@ -58,7 +58,7 @@ torchrun \
     --use_fsdp_model_ema=0 \
     --use_bit_label=1 \
     --zero=2 \
-    --save_control_epoch_freq=1 \
+    --save_car_epoch_freq=1 \
     --log_freq=10 \
     --checkpoint_type=torch \
     --prefetch_factor=2 \
@@ -67,28 +67,27 @@ torchrun \
     --apply_spatial_patchify=0 \
     --use_flex_attn=False \
     --pad=128 \
-    --save_control_separately=True \
-    --control_depth=4 \
-    --special_control_init=merge \
-    --disable_control_fusion=False \
-    --disable_control_merge=False \
-    --enable_control_modules=True \
+    --save_car_separately=True \
+    --car_depth=4 \
+    --special_car_init=merge \
+    --disable_car_fusion=False \
+    --disable_car_merge=False \
     --rms_norm=True \
     --enable_checkpointing=full-block \
     --enable_dynamic_scales=True \
-    --initial_training_scales 1 \
+    --initial_training_scales 7 \
     --dynamic_scale_target 13 \
     --dynamic_scale_patience_transition 10 \
-    --dynamic_scale_patience_low=100 \
-    --dynamic_scale_patience_high=100 \
-    --dynamic_scale_loss_window=100 \
-    --dynamic_scale_loss_delta=0.01 \
-    --control_block_lr_scale 0.4 \
-    --control_fusion_lr_scale 1.0 \
-    # --control_resume_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/control_weights_ep0007_it008000/control_weights.pth \
+    --dynamic_scale_patience_low=10 \
+    --dynamic_scale_patience_high=10 \
+    --dynamic_scale_loss_window=10 \
+    --dynamic_scale_loss_delta=0.05 \
+    --car_block_lr_scale 0.4 \
+    --car_fusion_lr_scale 1.0 \
+    # --car_resume_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/car_weights_ep0007_it008000/car_weights.pth \
     # --enable_checkpointing=0 \
     # --sync_tensorboard=True,
-    # --control_resume_path=None \
+    # --car_resume_path=None \
     # --debug=False, \
     # --always_training_scales=10 \
     

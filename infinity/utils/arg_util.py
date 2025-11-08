@@ -14,70 +14,6 @@ from tap import Tap
 
 import infinity.utils.dist as dist
 
-_LEGACY_CONTROL_FLAG_MAP = {
-    '--car_resume_path': '--control_resume_path',
-    '--special_car_init': '--special_control_init',
-    '--save_car_epoch_freq': '--save_control_epoch_freq',
-    '--save_car_step_freq': '--save_control_step_freq',
-    '--save_car_separately': '--save_control_separately',
-    '--car_lr_scale': '--control_lr_scale',
-    '--car_fusion_lr_scale': '--control_fusion_lr_scale',
-    '--car_block_lr_scale': '--control_block_lr_scale',
-    '--car_scale_reg': '--control_scale_reg',
-    '--enable_car_modules': '--enable_control_modules',
-    '--car_condition_channels': '--control_condition_channels',
-    '--car_mask_drop_prob': '--control_mask_drop_prob',
-    '--disable_car_fusion': '--disable_control_fusion',
-    '--disable_car_merge': '--disable_control_merge',
-    '--car_depth': '--control_depth',
-}
-_LEGACY_FLAG_NORMALIZED = False
-_CONTROL_ATTRIBUTE_ALIASES = {
-    'car_resume_path': 'control_resume_path',
-    'special_car_init': 'special_control_init',
-    'save_car_epoch_freq': 'save_control_epoch_freq',
-    'save_car_step_freq': 'save_control_step_freq',
-    'save_car_separately': 'save_control_separately',
-    'car_lr_scale': 'control_lr_scale',
-    'car_fusion_lr_scale': 'control_fusion_lr_scale',
-    'car_block_lr_scale': 'control_block_lr_scale',
-    'car_scale_reg': 'control_scale_reg',
-    'enable_car_modules': 'enable_control_modules',
-    'car_condition_channels': 'control_condition_channels',
-    'car_mask_drop_prob': 'control_mask_drop_prob',
-    'disable_car_fusion': 'disable_control_fusion',
-    'disable_car_merge': 'disable_control_merge',
-    'car_depth': 'control_depth',
-}
-
-
-def _remap_legacy_control_cli_flags(argv=None):
-    """Mutate sys.argv so legacy --car_* flags continue to work after renaming to control_*."""
-    global _LEGACY_FLAG_NORMALIZED
-    if _LEGACY_FLAG_NORMALIZED:
-        return
-    _LEGACY_FLAG_NORMALIZED = True
-
-    if argv is None:
-        argv = sys.argv
-    if not argv:
-        return
-
-    for idx, token in enumerate(argv):
-        if not token.startswith('--'):
-            continue
-        flag, eq, remainder = token.partition('=')
-        mapped = _LEGACY_CONTROL_FLAG_MAP.get(flag)
-        if mapped is None:
-            continue
-        if eq:
-            argv[idx] = f'{mapped}={remainder}'
-        else:
-            argv[idx] = mapped
-
-
-_remap_legacy_control_cli_flags()
-
 
 class Args(Tap):
     local_out_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'local_output')  # directory for save checkpoints
@@ -92,11 +28,11 @@ class Args(Tap):
     tf32: bool = True                   # whether to use TensorFloat32
     auto_resume: bool = True            # whether to automatically resume from the last checkpoint found in args.bed
     rush_resume: str = ''               # pretrained infinity checkpoint
-    control_resume_path: str = ''       # pretrained control checkpoint (for InfinityPilot)
-    special_control_init: str = ''      # special init method for control w/o pretrained weight: ['subset', 'interp', 'merge']
-    save_control_epoch_freq: int = 1    # 每多少個 epoch 保存一次 control 權重
-    save_control_step_freq: int = 500   # 每多少個訓練 step 保存一次 control 權重 (<=0 表示停用)
-    save_control_separately: bool = True  # 是否分別保存 control 權重
+    car_resume_path: str = ''           # pretrained CAR checkpoint (for InfinityPilot)
+    special_car_init:str = ''           # special init method for CAR w/o pretrained weight: ['subset', 'interp', 'merge']
+    save_car_epoch_freq: int = 1        # 每多少個 epoch 保存一次 CAR 權重
+    save_car_step_freq: int = 500       # 每多少個訓練 step 保存一次 CAR 權重 (<=0 表示停用)
+    save_car_separately: bool = True    # 是否分別保存 CAR 權重
     nowd: int = 1                       # whether to disable weight decay on sparse params (like class token)
     enable_hybrid_shard: bool = False   # whether to use hybrid FSDP
     inner_shard_degree: int = 1         # inner degree for FSDP
@@ -141,16 +77,15 @@ class Args(Tap):
     ca_gamma: float = -1                # >=0 for using layer-scale for cross attention
     diva: int = 1                       # rescale_attn_fc_weights
     hd0: float = 0.02                   # head.w *= hd0
-    control_lr_scale: float = 1.0       # learning-rate multiplier applied to control params
-    control_fusion_lr_scale: float = 0.1  # learning-rate multiplier applied to control fusion params
-    control_block_lr_scale: float = 10.0  # learning-rate multiplier applied to control block params
-    control_scale_reg: float = 5e-03    # L2 regularization weight for control skip_scale
-    enable_control_modules: bool = True # whether to build/use control modules
+    car_lr_scale: float = 1.0           # learning-rate multiplier applied to CAR params
+    car_fusion_lr_scale: float = 0.1    # learning-rate multiplier applied to CAR fusion params
+    car_block_lr_scale: float = 10.0    # learning-rate multiplier applied to CAR block params
+    car_scale_reg: float = 5e-03        # L2 regularization weight for car_skip_scale
     min_warmup_iters: int = 2048        # minimum warmup iterations (in steps)
-    control_condition_channels: int = 6   # number of channels for control condition input (normal map + mask)
-    control_mask_drop_prob: float = 0.1   # prob of dropping mask input (use normal map only)
-    disable_control_fusion: bool = False  # disable control fusion into Infinity blocks (for debugging)
-    disable_control_merge: bool = False   # disable control weight merging from Infinity blocks when initializing
+    car_condition_channels: int = 6     # number of channels for CAR condition input (normal map + mask)
+    car_mask_drop_prob: float = 0.1     # prob of dropping mask input (use normal map only)
+    disable_car_fusion: bool = False    # disable CAR fusion into Infinity blocks (for debugging)
+    disable_car_merge: bool = False     # disable CAR weight merging from Infinity blocks when initializing
     dec: int = 1                        # dec depth
     cum: int = 3                        # cumulating fea map as GPT TF input, 0: not cum; 1: cum @ next hw, 2: cum @ final hw
     rwe: bool = False                   # random word emb
@@ -316,12 +251,6 @@ class Args(Tap):
     prof_freq: int = 50     # profile
     tos_profiler_file_prefix: str = 'vgpt_default/'
     profall: int = 0
-    def process_args(self):
-        processed = super().process_args()
-        for legacy_attr, canonical_attr in _CONTROL_ATTRIBUTE_ALIASES.items():
-            setattr(processed, legacy_attr, getattr(processed, canonical_attr))
-        return processed
-
     @property
     def is_vae_visualization_only(self) -> bool:
         return self.v_seed > 0
@@ -339,9 +268,9 @@ class Args(Tap):
         # ======================== these parts are only for [Infinity_Pilot] usage by Kai ==============================
     debug:bool = False              # Selection of Debug mode: [True, False]
     sync_tensorboard:bool = False   # sync to tensorboard (model structure) [True, False]
-    # Ablation studies
-    control_depth: int = 4
-    rms_norm:bool = True            # whether to use RMSNorm in control blocks [True, False]
+    # Ablasion studies
+    car_depth:int = 4
+    rms_norm:bool = True            # whether to use RMSNorm in CAR blocks [True, False]
 
     # fusion_scale_lr_scale:float = 0.01  # learning-rate multiplier applied to fusion scale parameters in CAR blocks
 

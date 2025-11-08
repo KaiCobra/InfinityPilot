@@ -12,6 +12,7 @@ if repo_root not in sys.path:
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import os.path as osp
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import argparse
@@ -28,6 +29,7 @@ from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
 from infinity.models.infinity_pilot import InfinityPilot
 from infinity.models.infinity import MultipleLayers
 from infinity.models.basic import *  # noqa: F401,F403 required for model construction
+from infinity.models.bitwise_self_correction import BitwiseSelfCorrection
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 
 
@@ -48,6 +50,54 @@ def _ensure_list(values, length: int) -> List[float]:
     if len(values) < length:
         values = values + [values[-1]] * (length - len(values))
     return values
+
+
+def _requant_all_scales(
+    bsc: BitwiseSelfCorrection,
+    vae_scale_schedule: List[Tuple[int, int, int]],
+    raw_features: torch.Tensor,
+) -> List[torch.Tensor]:
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+        if raw_features.dim() == 4:
+            codes_out = raw_features.unsqueeze(2)
+        else:
+            codes_out = raw_features
+
+        final_size = vae_scale_schedule[-1]
+        if codes_out.shape[-3:] != final_size:
+            codes_out = F.interpolate(
+                codes_out,
+                size=final_size,
+                mode=bsc.vae.quantizer.z_interplote_up,
+            ).contiguous()
+
+        cum_var_input = 0
+        per_scale_tokens: List[torch.Tensor] = []
+
+        for si, (pt, ph, pw) in enumerate(vae_scale_schedule):
+            residual = codes_out - cum_var_input
+            if si != len(vae_scale_schedule) - 1:
+                residual = F.interpolate(
+                    residual,
+                    size=vae_scale_schedule[si],
+                    mode=bsc.vae.quantizer.z_interplote_down,
+                ).contiguous()
+
+            quantized, _, _, _ = bsc.vae.quantizer.lfq(residual)
+
+            tokens = quantized.squeeze(2)
+            if bsc.apply_spatial_patchify:
+                tokens = torch.nn.functional.pixel_unshuffle(tokens, 2)
+            tokens = tokens.flatten(2).transpose(1, 2).contiguous()
+            per_scale_tokens.append(tokens)
+
+            cum_var_input = cum_var_input + F.interpolate(
+                quantized,
+                size=vae_scale_schedule[-1],
+                mode=bsc.vae.quantizer.z_interplote_up,
+            ).contiguous()
+
+    return per_scale_tokens
 
 
 def transform(pil_img: Image.Image, tgt_h: int, tgt_w: int) -> torch.Tensor:
@@ -225,17 +275,17 @@ def build_infinity_pilot(
         apply_spatial_patchify=int(args.apply_spatial_patchify),
         inference_mode=True,
         train_h_div_w_list=[1.0],
-        disable_control_fusion=bool(args.disable_control_fusion),
-        disable_control_merge=bool(args.disable_control_merge),
-        init_control_modules=False,
+        disable_car_fusion=bool(args.disable_car_fusion),
+        disable_car_merge=bool(args.disable_car_merge),
+        init_car_modules=False,
         freeze_infinity=bool(args.freeze_infinity),
-        control_depth=int(args.control_depth),
+        car_depth=int(args.car_depth),
         **model_kwargs,
     )
     if args.shared_aln in (0, 1):
         pilot_kwargs['shared_aln'] = bool(args.shared_aln)
-    if int(args.control_depth) > 0:
-        pilot_kwargs['control_depth'] = int(args.control_depth)
+    if int(args.car_depth) > 0:
+        pilot_kwargs['car_depth'] = int(args.car_depth)
 
     pilot = InfinityPilot(infinity_base_model=base_state, **pilot_kwargs).to(device=device)
     if not hasattr(pilot, 'block_chunks'):
@@ -254,20 +304,20 @@ def build_infinity_pilot(
         load_sharded_checkpoint(pilot, args.model_path, strict=False)
         return pilot
     else:
-        if bool(args.init_control_modules) or args.control_path or args.pilot_checkpoint:
-            pilot.init_control_modules_if_needed()
+        if bool(args.init_car_modules) or args.car_path or args.pilot_checkpoint:
+            pilot.init_car_modules_if_needed()
             pilot.to(device)
 
     if args.pilot_checkpoint:
         full_state = load_checkpoint(args.pilot_checkpoint)
         missing, unexpected = pilot.load_state_dict(full_state, strict=bool(args.strict_load))
         print(f'[pilot] load_state_dict missing={len(missing)} unexpected={len(unexpected)}')
-    elif args.control_path:
-        control_state = load_checkpoint(args.control_path)
-        pilot.load_control_weights(control_state, strict=bool(args.strict_load))
+    elif args.car_path:
+        car_state = load_checkpoint(args.car_path)
+        pilot.load_car_weights(car_state, strict=bool(args.strict_load))
     else:
-        # If user did not request explicit control init, match training default when base weights available.
-        pilot.init_control_modules_if_needed()
+        # If user did not request explicit CAR init, match training default when base weights available.
+        pilot.init_car_modules_if_needed()
         pilot.to(device)
 
     return pilot
@@ -286,39 +336,59 @@ def _control_paths_from_args(args: argparse.Namespace) -> Dict[str, str]:
 
 def _build_control_tokens(
     control_paths: Dict[str, str],
-    model: InfinityPilot,
+    vae,
     scale_schedule: List[Tuple[int, int, int]],
     device: torch.device,
+    apply_spatial_patchify: bool,
 ) -> Optional[List[Optional[torch.Tensor]]]:
     if not control_paths:
         return None
-    has_control = getattr(model, 'has_control_modules', None)
-    if callable(has_control):
-        enabled = has_control()
-    elif hasattr(model, 'has_car_modules'):
-        enabled = model.has_car_modules()
-    else:
-        enabled = False
-    if not enabled:
-        return None
 
-    target_h = scale_schedule[-1][1]
-    target_w = scale_schedule[-1][2]
-    control_inputs: Dict[str, torch.Tensor] = {}
+    vae_scale_schedule = [
+        (pt, 2 * ph, 2 * pw) if apply_spatial_patchify else (pt, ph, pw)
+        for pt, ph, pw in scale_schedule
+    ]
+    target_h = vae_scale_schedule[-1][1]
+    target_w = vae_scale_schedule[-1][2]
+    args_ns = SimpleNamespace(
+        noise_apply_layers=0,
+        noise_apply_requant=1,
+        noise_apply_strength=0.0,
+        apply_spatial_patchify=apply_spatial_patchify,
+        debug_bsc=0,
+    )
+    bsc = BitwiseSelfCorrection(vae, args_ns)
 
+    tokens_by_type: Dict[str, List[torch.Tensor]] = {}
     for name, path in control_paths.items():
         if not osp.exists(path):
             print(f'[warn] control image missing: {path}')
             continue
         pil_img = Image.open(path).convert('RGB')
         tensor = transform(pil_img, target_h, target_w).unsqueeze(0).to(device)
-        control_inputs[name] = tensor
+        with torch.no_grad():
+            raw_features, _, _ = vae.encode_for_raw_features(tensor, scale_schedule=vae_scale_schedule)
+            per_scale = _requant_all_scales(bsc, vae_scale_schedule, raw_features)
 
-    if not control_inputs:
+        tokens_by_type[name] = [tok.to(device) for tok in per_scale]
+        print(f'[control] loaded {name} tokens across {len(per_scale)} scales')
+
+    if not tokens_by_type:
         return None
 
-    with torch.no_grad():
-        return model.build_control_tokens_from_inputs(control_inputs, scale_schedule)
+    combined: List[Optional[torch.Tensor]] = []
+    num_scales = len(scale_schedule)
+    for si in range(num_scales):
+        tokens_at_scale = [tokens[si] for tokens in tokens_by_type.values() if si < len(tokens)]
+        if not tokens_at_scale:
+            combined.append(None)
+            continue
+        if len(tokens_at_scale) == 1:
+            combined.append(tokens_at_scale[0])
+        else:
+            stacked = torch.stack(tokens_at_scale, dim=0)
+            combined.append(stacked.mean(dim=0))
+    return combined
 
 
 def gen_one_img_pilot(
@@ -418,15 +488,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--pn', type=str, required=True, choices=['0.06M', '0.25M', '1M'])
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--pilot_checkpoint', type=str, default='')
-    parser.add_argument('--control_path', type=str, default='/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/control_weights_ep0007_it008000/control_weights.pth')
-    parser.add_argument('--control_depth', type=int, default=8)
+    parser.add_argument('--car_path', type=str, default='/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/car_weights_ep0007_it008000/car_weights.pth')
+    parser.add_argument('--car_depth', type=int, default=8)
     parser.add_argument('--block_chunks', type=int, default=1)
     parser.add_argument('--checkpoint_type', type=str, default='torch', choices=['torch', 'torch_shard'])
 
-    parser.add_argument('--init_control_modules', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--init_car_modules', type=int, default=1, choices=[0, 1])
     parser.add_argument('--freeze_infinity', type=int, default=1, choices=[0, 1])
-    parser.add_argument('--disable_control_fusion', type=int, default=0, choices=[0, 1])
-    parser.add_argument('--disable_control_merge', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--disable_car_fusion', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--disable_car_merge', type=int, default=0, choices=[0, 1])
     parser.add_argument('--shared_aln', type=int, default=-1, choices=[-1, 0, 1])
     parser.add_argument('--strict_load', type=int, default=0, choices=[0, 1])
 
@@ -460,7 +530,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 @torch.no_grad()
 def main():
-    parser = argparse.ArgumentParser(description='Run InfinityPilot inference with optional control guidance')
+    parser = argparse.ArgumentParser(description='Run InfinityPilot inference with optional CAR control')
     add_arguments(parser)
     args = parser.parse_args()
 
@@ -479,21 +549,13 @@ def main():
     control_paths = _control_paths_from_args(args)
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]['scales']
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
-    control_tokens = None
-    has_control = getattr(infinity_pilot, 'has_control_modules', None)
-    if callable(has_control):
-        control_enabled = has_control()
-    elif hasattr(infinity_pilot, 'has_car_modules'):
-        control_enabled = infinity_pilot.has_car_modules()
-    else:
-        control_enabled = False
-    if control_paths and control_enabled:
-        control_tokens = _build_control_tokens(
-            control_paths,
-            infinity_pilot,
-            scale_schedule,
-            device,
-        )
+    control_tokens = _build_control_tokens(
+        control_paths,
+        vae,
+        scale_schedule,
+        device,
+        bool(args.apply_spatial_patchify),
+    )
 
     start = time.time()
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -533,5 +595,5 @@ if __name__ == '__main__':
     main()
 
 """
-python tools/run_infinity_pilot.py --pn 1M --model_path /home/avlab/SceneTxtVAR/weights/mm_2b.pth --text_encoder_ckpt /home/avlab/SceneTxtVAR/weights/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001 --vae_path /home/avlab/SceneTxtVAR/weights/infinity_vae_d32_reg.pth --prompt "a city street at dusk" --save_file ./outputs_pilot/sample.jpg --control_path /media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/control_weights_ep0007_it008000/control_weights.pth
+python tools/run_infinity_pilot.py --pn 1M --model_path /home/avlab/SceneTxtVAR/weights/mm_2b.pth --text_encoder_ckpt /home/avlab/SceneTxtVAR/weights/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001 --vae_path /home/avlab/SceneTxtVAR/weights/infinity_vae_d32_reg.pth --prompt "a city street at dusk" --save_file ./outputs_pilot/sample.jpg --car_path /media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/car_weights_ep0007_it008000/car_weights.pth
 """
