@@ -210,13 +210,12 @@ class InfinityPilot(Infinity):
         super().__init__(**filtered_kwargs)
         self.disable_control_fusion = kwargs.get('disable_control_fusion', False)
         self.control_condition_channels = kwargs.get('control_condition_channels', 6)
-        self.control_runtime_dtype = self._infer_control_runtime_dtype()
+        self.control_runtime_dtype = self.pos_1LC.dtype
         self.control_autocast_dtype = (
             torch.bfloat16 if self.control_runtime_dtype == torch.bfloat16
             else torch.float16 if self.control_runtime_dtype == torch.float16
-            else torch.bfloat16 if torch.cuda.is_available() else None
+            else None
         )
-        self.control_storage_dtype = self.control_autocast_dtype or self.control_runtime_dtype
         
         self.num_block_chunks = kwargs.get('block_chunks', 1)
         
@@ -236,27 +235,7 @@ class InfinityPilot(Infinity):
             self._init_control_modules()
 
         print("🔍 NaN detector registered on all normalization layers")
-
-    def _infer_control_runtime_dtype(self) -> torch.dtype:
-        """Best-effort inference of dtype for control tensors, covering checkpoints without pos_1LC."""
-        candidates = (
-            getattr(self, 'pos_1LC', None),
-            getattr(self, 'pos_start', None),
-            getattr(self, 'lvl_embed', None),
-            getattr(self, 'word_embed', None),
-            getattr(self, 'norm0_ve', None),
-        )
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            if isinstance(candidate, torch.Tensor):
-                return candidate.dtype
-            if isinstance(candidate, nn.Module):
-                if hasattr(candidate, 'weight') and isinstance(candidate.weight, torch.Tensor):
-                    return candidate.weight.dtype
-        print("[control_init] Warning: could not infer base dtype; defaulting control runtime dtype to float32.")
-        return torch.float32
-
+    
     def load_infinity_weights(self, infinity_model_or_state_dict):
         """從預訓練的 Infinity 模型載入權重，只載入非控制模塊"""
         if isinstance(infinity_model_or_state_dict, dict):
@@ -459,46 +438,39 @@ class InfinityPilot(Infinity):
                                               getattr(self, 'control_condition_channels', 3))
         self.control_condition_channels = control_in_channels
 
+        hidden = max(64, min(self.C // 2, 512))
+        self.control_encoder = nn.Sequential(
+            nn.Conv2d(control_in_channels, hidden, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, self.C, kernel_size=3, padding=1),
+        )
+        for module in self.control_encoder:
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, a=math.sqrt(5))
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        gate_hidden = max(64, self.C // 8)
+        self.control_scale_gate_mlp = nn.Sequential(
+            nn.Linear(self.C, gate_hidden),
+            nn.GELU(),
+            nn.Linear(gate_hidden, 1),
+        )
         self.max_control_scales = init_kwargs.get('always_training_scales',
                                                   getattr(self, 'always_training_scales', 20))
-        self.control_proj = nn.Linear(control_in_channels, self.C)
-        nn.init.xavier_uniform_(self.control_proj.weight)
-        if self.control_proj.bias is not None:
-            nn.init.zeros_(self.control_proj.bias)
-        self.control_scale_gates = nn.Parameter(torch.zeros(self.max_control_scales))
+        self.control_scale_gate_bias = nn.Parameter(torch.zeros(self.max_control_scales))
         self.control_token_norm = FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True)
-        self._control_gate_grad_mask = torch.ones_like(self.control_scale_gates)
-        self.control_scale_gates.register_hook(self._control_gate_grad_hook)
+        self.control_block_gates = nn.Parameter(torch.zeros(len(self.blocks)))
 
-        print("[control_init] Initialized lightweight per-scale control projection.")
+        print("[control_init] Initialized convolutional control encoder with gated fusion.")
 
     def has_control_modules(self):
         """檢查是否已初始化控制模塊"""
-        return hasattr(self, 'control_proj')
+        return hasattr(self, 'control_encoder')
 
     def has_car_modules(self):
         # legacy alias
         return self.has_control_modules()
-
-    def _control_gate_grad_hook(self, grad: torch.Tensor) -> torch.Tensor:
-        mask = getattr(self, '_control_gate_grad_mask', None)
-        if mask is None:
-            return grad
-        if mask.device != grad.device:
-            mask = mask.to(grad.device)
-            self._control_gate_grad_mask = mask
-        return grad * mask
-
-    def set_control_gate_train_index(self, index: Optional[int]):
-        if not self.has_control_modules():
-            return
-        if index is None or index < 0:
-            mask = torch.zeros_like(self.control_scale_gates)
-        else:
-            mask = torch.zeros_like(self.control_scale_gates)
-            if index < mask.numel():
-                mask[index] = 1.0
-        self._control_gate_grad_mask = mask.to(self.control_scale_gates.device)
 
     def _combine_control_inputs(self, control_inputs: Optional[Dict[str, torch.Tensor]]) -> Optional[torch.Tensor]:
         if control_inputs is None:
@@ -541,7 +513,16 @@ class InfinityPilot(Infinity):
         if control_image is None:
             return None
 
-        control_image = control_image.to(self.control_storage_dtype)
+        control_image = control_image.to(self.control_runtime_dtype)
+        use_autocast = self.control_autocast_dtype is not None and torch.cuda.is_available()
+        autocast_dtype = self.control_autocast_dtype if use_autocast else torch.float16
+        with torch.autocast(
+            device_type='cuda',
+            enabled=use_autocast,
+            dtype=autocast_dtype,
+        ):
+            feat = self.control_encoder(control_image)
+        feat = feat.to(self.control_runtime_dtype)
         control_tokens: List[Optional[torch.Tensor]] = []
         for pn in scale_schedule:
             if len(pn) == 3:
@@ -551,50 +532,144 @@ class InfinityPilot(Infinity):
             else:
                 raise ValueError(f"Unexpected scale tuple: {pn}")
 
-            ph = int(ph)
-            pw = int(pw)
-            resized = F.interpolate(control_image, size=(ph, pw), mode='bilinear', align_corners=False)
-            tokens = resized.permute(0, 2, 3, 1).reshape(resized.shape[0], ph * pw, self.control_condition_channels)
-            tokens = self.control_proj(tokens)
+            resized = F.interpolate(feat, size=(int(ph), int(pw)), mode='bilinear', align_corners=False)
+            tokens = resized.flatten(2).transpose(1, 2).contiguous()
             if pt > 1:
                 tokens = tokens.unsqueeze(2).expand(-1, -1, int(pt)).reshape(tokens.shape[0], -1, tokens.shape[-1])
-            tokens = self.control_token_norm(tokens.to(self.control_runtime_dtype)).to(self.control_storage_dtype)
+            tokens = self.control_token_norm(tokens)
             control_tokens.append(tokens)
 
         return control_tokens
 
-    def _compute_control_offsets(self, scale_schedule: List[Tuple[int, int, int]]) -> List[Tuple[int, int]]:
-        offsets = []
-        ptr = 1
-        for pn in scale_schedule:
-            length = int(np.prod(pn))
-            offsets.append((ptr, ptr + length))
-            ptr += length
-        return offsets
-
-    def _add_control_to_sequence(
+    def _prepare_control_scale_features(
         self,
-        seq: torch.Tensor,
-        control_tokens: Optional[List[Optional[torch.Tensor]]],
-        scale_offsets: Optional[List[Tuple[int, int]]],
-    ) -> torch.Tensor:
-        if not control_tokens or scale_offsets is None:
-            return seq
-        seqlen = seq.size(1)
-        for scale_idx, tokens in enumerate(control_tokens):
-            if tokens is None or scale_idx >= len(scale_offsets):
+        control_tokens: Optional[Union[List[Optional[torch.Tensor]], Dict[str, torch.Tensor], torch.Tensor]],
+        scale_schedule: List[Tuple[int, int, int]],
+    ) -> Optional[List[Optional[torch.Tensor]]]:
+        if not self.has_car_modules():
+            return None
+        if control_tokens is None:
+            return None
+        if isinstance(control_tokens, dict) or isinstance(control_tokens, torch.Tensor):
+            control_tokens = self.build_control_tokens_from_inputs(control_tokens, scale_schedule)
+        if not isinstance(control_tokens, (list, tuple)):
+            raise ValueError("control_tokens must be a list/tuple after preprocessing")
+
+        per_scale: List[Optional[torch.Tensor]] = []
+        for scale_idx, pn in enumerate(scale_schedule):
+            tokens = control_tokens[scale_idx] if scale_idx < len(control_tokens) else None
+            if tokens is None:
+                per_scale.append(None)
+                continue
+            if tokens.dim() == 4:
+                tokens = self.build_control_tokens_from_inputs({'control': tokens}, [pn])[0]
+            elif tokens.dim() != 3:
+                raise ValueError(f"Unsupported control token rank: {tokens.dim()}")
+            if tokens.shape[-1] != self.C:
+                raise ValueError(f"Control tokens dim {tokens.shape[-1]} != model dim {self.C}")
+            expected_len = int(np.prod(pn))
+            if tokens.shape[1] != expected_len:
+                if tokens.shape[1] == pn[1] * pn[2] and pn[0] > 1:
+                    tokens = tokens.unsqueeze(2).expand(-1, -1, int(pn[0])).reshape(tokens.shape[0], expected_len, self.C)
+                else:
+                    raise ValueError(f"Scale {scale_idx} tokens length mismatch: {tokens.shape[1]} vs {expected_len}")
+            per_scale.append(tokens.contiguous())
+        return per_scale
+
+    def _prepare_control_fusion_map(
+        self,
+        scale_schedule: List[Tuple[int, int, int]],
+        control_scale_features: Optional[List[Optional[torch.Tensor]]],
+        seq_len: int,
+    ) -> Dict[int, Tuple[int, Tuple[int, int], torch.Tensor, torch.Tensor]]:
+        if not control_scale_features:
+            return {}
+
+        scale_token_lengths = [int(np.prod(pn)) for pn in scale_schedule]
+        total_tokens = 1 + sum(scale_token_lengths)
+        if seq_len < total_tokens:
+            raise ValueError(f"seq_len ({seq_len}) must cover all scheduled tokens ({total_tokens})")
+
+        scale_offsets = []
+        ptr = 1
+        for length in scale_token_lengths:
+            scale_offsets.append((ptr, ptr + length))
+            ptr += length
+
+        num_blocks = len(self.blocks)
+        feature_device = None
+        for feat in control_scale_features:
+            if feat is not None:
+                feature_device = feat.device
+                break
+        if feature_device is None:
+            return {}
+        tokens_per_scale = torch.tensor(scale_token_lengths, dtype=torch.float32, device=feature_device)
+        ratios = (tokens_per_scale / tokens_per_scale.sum()).tolist()
+        blocks_per_scale = [max(1, int(round(r * num_blocks))) for r in ratios]
+        delta = sum(blocks_per_scale) - num_blocks
+        if delta > 0:
+            for i in range(len(blocks_per_scale)):
+                if delta == 0:
+                    break
+                if blocks_per_scale[i] > 1:
+                    blocks_per_scale[i] -= 1
+                    delta -= 1
+        elif delta < 0:
+            for i in reversed(range(len(blocks_per_scale))):
+                if delta == 0:
+                    break
+                blocks_per_scale[i] += 1
+                delta += 1
+
+        scale_block_ranges = []
+        cursor = 0
+        for cnt in blocks_per_scale:
+            scale_block_ranges.append((cursor, cursor + cnt))
+            cursor += cnt
+        assert cursor == num_blocks
+
+        fusion_map: Dict[int, Tuple[int, Tuple[int, int], torch.Tensor, torch.Tensor]] = {}
+        for scale_idx, (b_start, b_end) in enumerate(scale_block_ranges):
+            feat = control_scale_features[scale_idx] if scale_idx < len(control_scale_features) else None
+            if feat is None:
                 continue
             start, end = scale_offsets[scale_idx]
+            feat = feat.to(self.control_runtime_dtype)
+            scale_context = feat.mean(dim=1)
+            bias_idx = min(scale_idx, self.control_scale_gate_bias.shape[0] - 1)
+            gate_bias = self.control_scale_gate_bias[bias_idx].to(scale_context.dtype)
+            gate = torch.sigmoid(self.control_scale_gate_mlp(scale_context) + gate_bias)
+            gate = gate.view(gate.shape[0], 1, 1).to(self.control_runtime_dtype)
+            for bidx in range(b_start, b_end):
+                fusion_map[bidx] = (scale_idx, (start, end), feat, gate)
+        return fusion_map
+
+    def _make_control_fusion_hook(self, fusion_map: Dict[int, Tuple[int, Tuple[int, int], torch.Tensor, torch.Tensor]]):
+        if not fusion_map or self.disable_control_fusion:
+            return lambda _idx, seq: seq
+
+        def _apply(block_index: int, seq: torch.Tensor) -> torch.Tensor:
+            entry = fusion_map.get(block_index)
+            if entry is None:
+                return seq
+
+            _, (start, end), feat, scale_gate = entry
+            seqlen = seq.size(1)
             seg_start = min(start, seqlen)
             seg_end = min(end, seqlen)
             if seg_end <= seg_start:
-                continue
-            seg_len = seg_end - seg_start
-            gate_idx = min(scale_idx, self.control_scale_gates.numel() - 1)
-            gate = torch.sigmoid(self.control_scale_gates[gate_idx]).to(seq.dtype)
-            seq[:, seg_start:seg_end, :].add_(gate * tokens[:, :seg_len, :].to(seq.dtype))
-        return seq
+                return seq
 
+            seg_len = seg_end - seg_start
+            ctrl_seg = feat[:, :seg_len, :].to(seq.dtype) * scale_gate.to(seq.dtype)
+
+            gate_idx = min(block_index, self.control_block_gates.numel() - 1)
+            block_gate = torch.sigmoid(self.control_block_gates[gate_idx]).to(seq.dtype)
+            seq[:, seg_start:seg_end, :].add_(block_gate * ctrl_seg)
+            return seq
+
+        return _apply
 
     def init_control_modules_if_needed(self):
         """如果尚未初始化則初始化控制模塊"""
@@ -798,41 +873,50 @@ class InfinityPilot(Infinity):
         else:
             attn_fn = None
 
-        prepared_control_tokens = None
-        control_offsets = None
-        if control_tokens is not None:
-            if isinstance(control_tokens, (list, tuple)):
-                prepared_control_tokens = control_tokens
-            else:
-                prepared_control_tokens = self.build_control_tokens_from_inputs(control_tokens, scale_schedule)
-        if prepared_control_tokens:
-            control_offsets = self._compute_control_offsets(scale_schedule)
+        control_scale_features = self._prepare_control_scale_features(control_tokens, scale_schedule)
+        total_seq_tokens = 1 + sum(int(np.prod(pn)) for pn in scale_schedule)
+        if self.use_flex_attn and self.pad_to_multiplier:
+            seq_len_for_control = ((total_seq_tokens + self.pad_to_multiplier - 1) // self.pad_to_multiplier) * self.pad_to_multiplier
+        else:
+            seq_len_for_control = total_seq_tokens
+        fusion_map = self._prepare_control_fusion_map(
+            scale_schedule=scale_schedule,
+            control_scale_features=control_scale_features,
+            seq_len=seq_len_for_control,
+        )
+        _apply_control_fusion = self._make_control_fusion_hook(fusion_map)
 
         # [2. block loop] - 修改以支援控制條件
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training
         if self.num_block_chunks == 1:
+            global_block_idx = 0
             for i, b in enumerate(self.blocks):
+                # x_BLC = _apply_control_fusion(global_block_idx, x_BLC)
                 if self.add_lvl_embeding_only_first_block and i == 0:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                if prepared_control_tokens and i == len(self.blocks) - 1:
-                    x_BLC = self._add_control_to_sequence(x_BLC, prepared_control_tokens, control_offsets)
+                
+                x_BLC = _apply_control_fusion(global_block_idx, x_BLC)
                 if checkpointing_full_block:
                     x_BLC = torch.utils.checkpoint.checkpoint(b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
                 else:
                     x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid)
+                
+                global_block_idx += 1
         else:
+            print("[WARNING] Using block chunks while control fusion is active; ensure this is intended.")
             global_block_idx = 0
             for i, chunk in enumerate(self.block_chunks):
-                def fusion_cb(_idx, seq):
-                    return seq
+                def fusion_cb(idx, seq):
+                    return _apply_control_fusion(idx, seq)
                 if self.add_lvl_embeding_only_first_block and i == 0:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                if prepared_control_tokens and i == len(self.block_chunks) - 1:
-                    x_BLC = self._add_control_to_sequence(x_BLC, prepared_control_tokens, control_offsets)
+
+                # 在後半部分塊中融合控制特徵
+                x_BLC = _apply_control_fusion(global_block_idx, x_BLC)
                 x_BLC = chunk(
                     x=x_BLC,
                     cond_BD=cond_BD_or_gss,
@@ -909,15 +993,18 @@ class InfinityPilot(Infinity):
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
         
-        prepared_control_tokens = None
-        control_offsets = None
-        if control_tokens is not None:
-            if isinstance(control_tokens, (list, tuple)):
-                prepared_control_tokens = control_tokens
-            else:
-                prepared_control_tokens = self.build_control_tokens_from_inputs(control_tokens, scale_schedule)
-        if prepared_control_tokens:
-            control_offsets = self._compute_control_offsets(scale_schedule)
+        control_scale_features = self._prepare_control_scale_features(control_tokens, scale_schedule)
+        total_seq_tokens = 1 + sum(int(np.prod(pn)) for pn in scale_schedule)
+        if self.use_flex_attn and self.pad_to_multiplier:
+            seq_len_for_control = ((total_seq_tokens + self.pad_to_multiplier - 1) // self.pad_to_multiplier) * self.pad_to_multiplier
+        else:
+            seq_len_for_control = total_seq_tokens
+        fusion_map = self._prepare_control_fusion_map(
+            scale_schedule=scale_schedule,
+            control_scale_features=control_scale_features,
+            seq_len=seq_len_for_control,
+        )
+        apply_control = self._make_control_fusion_hook(fusion_map)
 
         # define model blocks
         if inference_mode:
@@ -966,10 +1053,10 @@ class InfinityPilot(Infinity):
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 if not self.add_lvl_embeding_only_first_block: 
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                if prepared_control_tokens and block_idx == len(self.block_chunks) - 1:
-                    last_stage = self._add_control_to_sequence(last_stage, prepared_control_tokens, control_offsets)
                 
                 for m in b.module:
+                    # 在後半部分融合控制特徵
+                    last_stage = apply_control(global_block_idx, last_stage)
                     last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
                     
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):

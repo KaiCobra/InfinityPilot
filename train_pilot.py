@@ -535,6 +535,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         gpt_ddp: DDP = ddp_class(gpt_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=find_unused, broadcast_buffers=False)
     torch.cuda.synchronize()
     
+<<<<<<< ours
     if args.enable_control_modules:
         # 重要：DDP 包装後重新確保凍結狀態
         print("[DEBUG] Re-verifying and enforcing freeze status after DDP wrapping:")
@@ -553,6 +554,25 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         
         # 验证最终状态
         debug_parameter_freeze_status(base_model)
+=======
+    # 重要：DDP 包装後重新確保凍結狀態
+    print("[DEBUG] Re-verifying and enforcing freeze status after DDP wrapping:")
+    base_model = gpt_ddp.module if hasattr(gpt_ddp, 'module') else gpt_ddp
+    
+    # 强制重新冻结 Infinity 参数
+    frozen_count = 0
+    for name, param in base_model.named_parameters():
+        if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen_count += 1
+    
+    if frozen_count > 0:
+        print(f"  Re-frozen {frozen_count} Infinity parameters after DDP wrapping")
+    
+    # 验证最终状态
+    debug_parameter_freeze_status(base_model)
+>>>>>>> theirs
 
     # =============== build optimizer ===============
     # 創建一個只包含可訓練參數的模型包裝器，以避免 filter_params 中的 names_no_grad 斷言錯誤

@@ -128,8 +128,8 @@ def build_model_optimizer(args, vae_ckpt):
     # Step 1: Create model without loading weights first
     gpt_wo_ddp = InfinityPilot(
         infinity_base_model=None,  # Don't load weights yet
-        init_car_modules=args.enable_car_modules,
-        freeze_infinity=True,
+        init_car_modules=True,    # Don't init CAR yet
+        freeze_infinity=True,     # Freeze infinity
         **gpt_kw
     )
     
@@ -141,23 +141,14 @@ def build_model_optimizer(args, vae_ckpt):
         del infinity_checkpoint
         torch.cuda.empty_cache()
     
-    # Step 3: Initialize control modules and freeze infinity if needed
-    if args.enable_car_modules:
-        gpt_wo_ddp.init_car_modules_if_needed()
-        gpt_wo_ddp.freeze_infinity_parameters()
-        debug_parameter_freeze_status(gpt_wo_ddp)
-    else:
-        print("[INFO] CAR modules disabled; Infinity base parameters remain trainable.")
+    # Step 3: Initialize CAR modules and freeze infinity
+    gpt_wo_ddp._init_car_modules()
+    gpt_wo_ddp.freeze_infinity_parameters()
+    # Debug console: {(name, p.grad.shape) for name, p in gpt_wo_ddp.named_parameters() if p.grad is not None}
 
-    if args.enable_car_modules:
-        # Re-init CAR params (optional fine-tune reset)
-        car_params = gpt_wo_ddp.get_car_parameters()
-        for param in car_params:
-            if param.ndim >= 2:
-                torch.nn.init.xavier_uniform_(param, gain=args.tini if args.tini > 0 else 1.0)
-            else:
-                torch.nn.init.zeros_(param)
-
+    # verify freeze state
+    debug_parameter_freeze_status(gpt_wo_ddp)
+    
     # Memory monitoring after model creation
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -166,7 +157,17 @@ def build_model_optimizer(args, vae_ckpt):
     if args.tini < 0:
         args.tini = math.sqrt(1 / gpt_wo_ddp.C / 3)
     
-    print("InfinityPilot initialized (CAR modules {}enabled)".format("" if args.enable_car_modules else "dis"))
+    # Only initialize CAR modules, Infinity part is already loaded
+    car_params = gpt_wo_ddp.get_car_parameters()
+    for param in car_params:
+        if param.ndim >= 2:  
+            # for matrices in Linear and Conv layers
+            torch.nn.init.xavier_uniform_(param, gain=args.tini)
+        else:  
+            # for biases and LayerNorm/GroupNorm weights
+            torch.nn.init.zeros_(param)
+    
+    print("InfinityPilot initialized with automatic checkpoint loading and CAR modules trainable")
     
     # Update word embedding settings if needed
     if args.rwe:
@@ -250,37 +251,31 @@ def build_model_optimizer(args, vae_ckpt):
         gpt_ddp: DDP = ddp_class(gpt_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=find_unused, broadcast_buffers=False)
     torch.cuda.synchronize()
     
-    if args.enable_car_modules:
-        # 重要：DDP 包装後重新確保凍結狀態
-        print("[DEBUG] Re-verifying and enforcing freeze status after DDP wrapping:")
-        base_model = gpt_ddp.module if hasattr(gpt_ddp, 'module') else gpt_ddp
-        
-        # 强制重新冻结 Infinity 参数
-        frozen_count = 0
-        for name, param in base_model.named_parameters():
-            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
-                if param.requires_grad:
-                    param.requires_grad = False
-                    frozen_count += 1
-        
-        if frozen_count > 0:
-            print(f"  Re-frozen {frozen_count} Infinity parameters after DDP wrapping")
-        
-        # 验证最终状态
-        debug_parameter_freeze_status(base_model)
+    # 重要：DDP 包装後重新確保凍結狀態
+    print("[DEBUG] Re-verifying and enforcing freeze status after DDP wrapping:")
+    base_model = gpt_ddp.module if hasattr(gpt_ddp, 'module') else gpt_ddp
+    
+    # 强制重新冻结 Infinity 参数
+    frozen_count = 0
+    for name, param in base_model.named_parameters():
+        if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen_count += 1
+    
+    if frozen_count > 0:
+        print(f"  Re-frozen {frozen_count} Infinity parameters after DDP wrapping")
+    
+    # 验证最终状态
+    debug_parameter_freeze_status(base_model)
 
     # =============== build optimizer ===============
     # 創建一個只包含可訓練參數的模型包裝器，以避免 filter_params 中的 names_no_grad 斷言錯誤
     class TrainableParametersWrapper:
-        """只包含可訓練參數的模型包裝器，可依名稱過濾。"""
-        def __init__(self, model, prefixes_to_include: Optional[List[str]] = None):
+        """只包含可訓練參數的模型包裝器"""
+        def __init__(self, model):
             self.model = model
-            self._trainable_params = []
-            for name, param in model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if prefixes_to_include is None or any(pfx in name for pfx in prefixes_to_include):
-                    self._trainable_params.append((name, param))
+            self._trainable_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
             
         def named_parameters(self):
             return self._trainable_params
@@ -290,15 +285,11 @@ def build_model_optimizer(args, vae_ckpt):
             return getattr(self.model, name)
     
     # 使用包裝器來只處理可訓練的參數
-    include_prefixes = ['car_', 'control_'] if args.enable_car_modules else None
-    trainable_model_wrapper = TrainableParametersWrapper(
-        gpt_ddp if args.zero else gpt_wo_ddp,
-        prefixes_to_include=include_prefixes,
-    )
+    trainable_model_wrapper = TrainableParametersWrapper(gpt_ddp if args.zero else gpt_wo_ddp)
     
     nowd_keys = set()
     _temp_ = args.nowd 
-    if args.nowd >= 1 and args.enable_car_modules:
+    if args.nowd >= 1:
         # 只包含實際存在於可訓練參數中的 no weight decay 參數
         nowd_keys |= {
             # CAR 相關的參數

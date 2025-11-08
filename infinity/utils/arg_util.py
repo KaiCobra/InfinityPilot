@@ -146,12 +146,6 @@ class Args(Tap):
     control_block_lr_scale: float = 10.0  # learning-rate multiplier applied to control block params
     control_scale_reg: float = 5e-03    # L2 regularization weight for control skip_scale
     enable_control_modules: bool = True # whether to build/use control modules
-    enable_nan_detector: bool = False   # attach NaN detector hooks on norms
-    enable_grad_monitor: bool = False   # log mean-abs gradients for control modules
-    grad_monitor_interval: int = 1000   # steps between grad monitor logs
-    enable_training_visualizer: bool = False  # dump training visualization samples
-    visualize_interval: int = 100       # iterations between training visualizations
-    enable_param_visualizer: bool = False  # track parameter drift over time
     min_warmup_iters: int = 2048        # minimum warmup iterations (in steps)
     control_condition_channels: int = 6   # number of channels for control condition input (normal map + mask)
     control_mask_drop_prob: float = 0.1   # prob of dropping mask input (use normal map only)
@@ -324,14 +318,8 @@ class Args(Tap):
     profall: int = 0
     def process_args(self):
         processed = super().process_args()
-        if processed is None:
-            processed = self
         for legacy_attr, canonical_attr in _CONTROL_ATTRIBUTE_ALIASES.items():
-            value = getattr(processed, canonical_attr, None)
-            if value is None and hasattr(processed, legacy_attr):
-                value = getattr(processed, legacy_attr)
-            setattr(processed, legacy_attr, value)
-            setattr(processed, canonical_attr, value)
+            setattr(processed, legacy_attr, getattr(processed, canonical_attr))
         return processed
 
     @property

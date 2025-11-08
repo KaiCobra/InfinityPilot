@@ -4,7 +4,7 @@ import gc
 import os.path as osp
 from functools import partial
 from pprint import pformat
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import List, Optional, Tuple, Union, Dict
 from collections import defaultdict, deque
 
 import seaborn as sns
@@ -189,10 +189,6 @@ class InfinityPilotTrainer(object):
         print(f'self.reweight_loss_by_scale: {self.reweight_loss_by_scale}')
         self.text_tokenizer = None
         self.text_encoder = None
-        self.enable_training_visualizer = bool(getattr(other_args, 'enable_training_visualizer', False)) if other_args is not None else False
-        self.visualize_interval = max(1, int(getattr(other_args, 'visualize_interval', 100))) if self.enable_training_visualizer else 100
-        self.grad_monitor_enabled = bool(getattr(other_args, 'enable_grad_monitor', False)) if other_args is not None else False
-        self.grad_monitor_interval = max(1, int(getattr(other_args, 'grad_monitor_interval', 1000))) if self.grad_monitor_enabled else 1000
         self.last_train_loss: Optional[float] = None
         base_scale_limit = getattr(other_args, 'always_training_scales', 1) if other_args is not None else 1
         self.base_training_scale_limit = max(1, int(base_scale_limit))
@@ -231,8 +227,6 @@ class InfinityPilotTrainer(object):
         
         self._control_gradient_setup = False
         self._setup_control_parameter_gradients()
-        self._control_token_cache: Dict[str, Any] = {'key': None, 'tokens': None}
-        self._batch_feature_cache: Dict[str, Any] = {'key': None, 'data': None}
 
         # Print parameter counts (after gradient setup to reflect actual trainable stats)
         control_params = sum(p.numel() for p in gpt_uncompiled.get_control_parameters() if p.requires_grad)
@@ -303,22 +297,23 @@ class InfinityPilotTrainer(object):
         
         # Initialize parameter visualizer if available
         self.param_visualizer = None
-        enable_param_vis = bool(getattr(other_args, 'enable_param_visualizer', False)) if other_args is not None else False
-        if VISUALIZER_AVAILABLE and enable_param_vis and dist.is_master():
+        if False:
+        # if VISUALIZER_AVAILABLE and dist.is_master() and False:
             try:
+                # Get the underlying model without DDP/FSDP wrapper
                 underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
                 self.param_visualizer = ParameterChangeVisualizer(
-                    underlying_model,
+                    underlying_model, 
                     save_dir=f"./debug/param_visualizations_{time.strftime('%m%d_%H%M%S')}"
                 )
+                # print("✅ Parameter visualizer initialized")
             except Exception as e:
                 print(f"⚠️ Failed to initialize parameter visualizer: {e}")
                 self.param_visualizer = None
         
         # Initialize NaN detector if available
         self.nan_detector = None
-        enable_nan_detector = bool(getattr(other_args, 'enable_nan_detector', False)) if other_args is not None else False
-        if enable_nan_detector and NAN_DETECTOR_AVAILABLE:
+        if NAN_DETECTOR_AVAILABLE and getattr(other_args, 'enable_nan_detector', True):
             try:
                 underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
                 self.nan_detector = NaNDetector(underlying_model, check_backward=True, verbose=True)
@@ -327,8 +322,6 @@ class InfinityPilotTrainer(object):
             except Exception as e:
                 print(f"⚠️ Failed to initialize NaN detector: {e}")
                 self.nan_detector = None
-        elif enable_nan_detector:
-            print("⚠️ NaN detector requested but unavailable on this build.")
 
     def register_text_encoder(self, tokenizer, encoder):
         """Attach tokenizer and encoder for evaluation-time caption encoding."""
@@ -618,6 +611,10 @@ class InfinityPilotTrainer(object):
             full_scale_schedule = full_scale_schedule[:available_scales]
             gt_ms_idx_Bl = gt_ms_idx_Bl[:available_scales]
             
+            full_control_tokens = None
+            if condition_inputs:
+                full_control_tokens = self._build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
+            
             scale_limit = min(self.base_training_scale_limit, available_scales)
             training_scales = min(scale_limit, self.active_training_scales)
             if training_scales <= 0:
@@ -625,7 +622,9 @@ class InfinityPilotTrainer(object):
             self.last_training_scales = training_scales
             scale_schedule = full_scale_schedule[:training_scales]
             gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
-            control_tokens = self._get_or_build_control_tokens(condition_inputs, scale_schedule, training_scales)
+            control_tokens = None
+            if full_control_tokens is not None:
+                control_tokens = full_control_tokens[:training_scales]
             training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
             first_scale_tokens = int(np.prod(scale_schedule[0]))
             x_BLC_wo_prefix = x_BLC_wo_prefix_full[:, :(training_seq_len-first_scale_tokens), :]
@@ -723,64 +722,6 @@ class InfinityPilotTrainer(object):
         with torch.no_grad():
             return model.build_control_tokens_from_inputs(condition_inputs, target_schedule)
 
-    def _make_condition_cache_key(self, condition_inputs: Optional[Dict[str, torch.Tensor]], scale_schedule) -> Optional[Tuple[Any, ...]]:
-        if not condition_inputs:
-            return None
-        descriptors = []
-        for name in sorted(condition_inputs.keys()):
-            tensor = condition_inputs[name]
-            if tensor is None or not isinstance(tensor, torch.Tensor):
-                continue
-            device = tensor.device
-            device_info = (device.type, device.index if device.type == 'cuda' else -1)
-            descriptors.append((
-                name,
-                int(tensor.data_ptr()),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                device_info,
-                str(tensor.dtype),
-            ))
-        if not descriptors:
-            return None
-        schedule_key = tuple(tuple(int(x) for x in pn) for pn in scale_schedule)
-        return (tuple(descriptors), schedule_key)
-
-    def _get_or_build_control_tokens(self, condition_inputs, scale_schedule, training_scales):
-        if condition_inputs is None or len(condition_inputs) == 0:
-            return None
-        cache_key = self._make_condition_cache_key(condition_inputs, scale_schedule[:training_scales] if training_scales is not None else scale_schedule)
-        if cache_key is not None and self._control_token_cache.get('key') == cache_key:
-            return self._control_token_cache.get('tokens')
-        tokens = self._build_control_tokens(condition_inputs, scale_schedule, training_scales)
-        if cache_key is not None and tokens is not None:
-            cached_tokens = [None if t is None else t.detach() for t in tokens]
-            self._control_token_cache = {'key': cache_key, 'tokens': cached_tokens}
-            return cached_tokens
-        return tokens
-
-    def _make_batch_cache_key(self, inp_B3HW: torch.Tensor, condition_inputs: Optional[Dict[str, torch.Tensor]]) -> Optional[Tuple[Any, ...]]:
-        if not isinstance(inp_B3HW, torch.Tensor):
-            return None
-        key_components = [
-            ('inp', int(inp_B3HW.data_ptr()), tuple(inp_B3HW.shape), str(inp_B3HW.dtype),
-             (inp_B3HW.device.type, -1 if inp_B3HW.device.type == 'cpu' else inp_B3HW.device.index))
-        ]
-        if condition_inputs:
-            for name in sorted(condition_inputs.keys()):
-                tensor = condition_inputs[name]
-                if tensor is None or not isinstance(tensor, torch.Tensor):
-                    continue
-                dev = tensor.device
-                key_components.append((
-                    name,
-                    int(tensor.data_ptr()),
-                    tuple(tensor.shape),
-                    str(tensor.dtype),
-                    (dev.type, -1 if dev.type == 'cpu' else dev.index)
-                ))
-        return tuple(key_components)
-
     @staticmethod
     def _slice_text_cond_for_eval(text_tuple, index: int) -> Optional[Tuple[torch.Tensor, List[int], torch.Tensor, int]]:
         if not isinstance(text_tuple, tuple) or len(text_tuple) != 4:
@@ -809,12 +750,7 @@ class InfinityPilotTrainer(object):
         V = self.vae_local.vocab_size
         device = inp_B3HW.device
         warmup_steps = self.logging_warmup_steps
-        should_visualize_batch = (
-            self.enable_training_visualizer
-            and dist.is_master()
-            and (self.visualize_interval > 0)
-            and (it % self.visualize_interval == 0)
-        )
+        should_visualize_batch = (it % 10 == 0 and dist.is_master())
         full_gt_ms_idx_Bl = None
 
         h_div_w = inp_B3HW.shape[-2] / inp_B3HW.shape[-1]
@@ -822,7 +758,6 @@ class InfinityPilotTrainer(object):
         h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
         full_scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
         full_scale_schedule = [(min(t, T//4+1), h, w) for (t, h, w) in full_scale_schedule]
-        batch_cache_key = self._make_batch_cache_key(inp_B3HW, condition_inputs)
         
 
         # [forward]
@@ -835,60 +770,35 @@ class InfinityPilotTrainer(object):
         #     print(f"❌ [it={it}] Inf in input inp_B3HW!")
         
         with self.gpt_opt.amp_ctx:
-            cached_batch = None
-            if batch_cache_key is not None and self._batch_feature_cache.get('key') == batch_cache_key:
-                cached_batch = self._batch_feature_cache.get('data')
-
-            if cached_batch is not None:
-                full_scale_schedule = list(cached_batch['full_scale_schedule'])
-                full_vae_scale_schedule = list(cached_batch['full_vae_scale_schedule'])
-                raw_features = cached_batch['raw_features']
-                x_BLC_wo_prefix_full = cached_batch['x_BLC_wo_prefix_full']
-                gt_ms_idx_Bl_full = [tensor for tensor in cached_batch['gt_ms_idx_Bl_full']]
-                if should_visualize_batch:
-                    full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl_full]
-            else:
+            with torch.no_grad():
                 if args.apply_spatial_patchify:
                     full_vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in full_scale_schedule]
                 else:
                     full_vae_scale_schedule = full_scale_schedule
-                with torch.no_grad():
-                    raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=full_vae_scale_schedule)
+                vae_scale_schedule = full_vae_scale_schedule
+                raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=vae_scale_schedule)
 
-                x_BLC_wo_prefix_full, gt_ms_idx_Bl_full = self.bitwise_self_correction.flip_requant(full_vae_scale_schedule, inp_B3HW, raw_features, device)
-                if should_visualize_batch:
-                    full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl_full]
-                if batch_cache_key is not None:
-                    self._batch_feature_cache = {
-                        'key': batch_cache_key,
-                        'data': {
-                            'full_scale_schedule': tuple(full_scale_schedule),
-                            'full_vae_scale_schedule': tuple(full_vae_scale_schedule),
-                            'raw_features': raw_features,
-                            'x_BLC_wo_prefix_full': x_BLC_wo_prefix_full,
-                            'gt_ms_idx_Bl_full': tuple(gt_ms_idx_Bl_full),
-                        }
-                    }
+            x_BLC_wo_prefix, gt_ms_idx_Bl = self.bitwise_self_correction.flip_requant(vae_scale_schedule, inp_B3HW, raw_features, device)
+            if should_visualize_batch:
+                full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl]
+            full_control_tokens = None
+            if condition_inputs:
+                full_control_tokens = self._build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
 
             # truncate scales
-            available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl_full))
+            available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl))
             scale_limit = min(self.base_training_scale_limit, available_scales)
             training_scales = min(scale_limit, self.active_training_scales)
             if training_scales <= 0:
                 raise RuntimeError("No valid scales available; check VAE outputs or dynamic resolution settings.")
             self.last_training_scales = training_scales
             scale_schedule = full_scale_schedule[:training_scales]
-            gt_ms_idx_Bl = gt_ms_idx_Bl_full[:training_scales]
-            control_tokens = self._get_or_build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
-            if control_tokens is not None:
-                control_tokens = control_tokens[:training_scales]
-
-            underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-            if hasattr(underlying_model, 'set_control_gate_train_index'):
-                gate_idx = training_scales - 1 if training_scales > 0 else None
-                underlying_model.set_control_gate_train_index(gate_idx)
+            gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
+            control_tokens = None
+            if full_control_tokens is not None:
+                control_tokens = full_control_tokens[:training_scales]
             training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
-            x_BLC_wo_prefix = x_BLC_wo_prefix_full[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
+            x_BLC_wo_prefix = x_BLC_wo_prefix[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
 
 
             # [forward]
@@ -994,13 +904,11 @@ class InfinityPilotTrainer(object):
         if args.use_fsdp_model_ema:
             update_ema(self.gpt_ema, self.gpt)
 
-        grad_stats = {}
         # [zero_grad]
         if stepping:
-            self._control_token_cache = {'key': None, 'tokens': None}
-            self._batch_feature_cache = {'key': None, 'data': None}
-            log_grad_monitor = self.grad_monitor_enabled and (g_it % self.grad_monitor_interval == 0)
-            if log_grad_monitor and dist.is_master(): # 只在主進程執行
+            grad_stats = {}
+             # 梯度監控
+            if dist.is_master(): # 只在主進程執行
                 import matplotlib.pyplot as plt
                 import seaborn as sns
                 import pandas as pd
