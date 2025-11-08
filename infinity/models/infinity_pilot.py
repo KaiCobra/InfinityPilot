@@ -559,14 +559,21 @@ class InfinityPilot(Infinity):
                 nn.init.ones_(norm.weight)
 
         self.car_fusion_linears = nn.ModuleList([
-            nn.Linear(2 * self.C, self.C)
+            nn.Sequential(
+                nn.Linear(2 * self.C, 4 * self.C),
+                nn.GELU(),
+                nn.Linear(4 * self.C, self.C)
+                )
             for _ in range(self.car_depth)
         ])
 
-        for linear in self.car_fusion_linears:
-            nn.init.xavier_uniform_(linear.weight)
-            if linear.bias is not None:
-                nn.init.zeros_(linear.bias)
+        for seq in self.car_fusion_linears:
+            first, _, last = seq
+            nn.init.xavier_uniform_(first.weight)
+            nn.init.zeros_(first.bias)
+            nn.init.xavier_uniform_(last.weight)
+            last.weight.data.mul_(0.5)  # 只縮小第二層
+            nn.init.zeros_(last.bias)
 
         # self.car_fusion_scales = nn.Parameter(torch.zeros(self.car_depth))
 
@@ -770,7 +777,7 @@ class InfinityPilot(Infinity):
             if car_feat.size(1) < seq.size(1):
                 raise ValueError(f"CAR feature length {car_feat.size(1)} shorter than sequence {seq.size(1)}")
             car_slice = car_feat[:, :seq.size(1), :].to(seq.dtype)
-            seq_with_car = torch.cat([seq.detach(), car_slice], dim=-1)
+            seq_with_car = torch.cat([seq, car_slice], dim=-1)
             seq_with_car = self.car_fusion_norms[car_idx](seq_with_car)
             fusion_delta = self.car_fusion_linears[car_idx](seq_with_car)
             fused = seq + fusion_delta

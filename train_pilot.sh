@@ -57,7 +57,7 @@ torchrun \
     --rope2d_normalized_by_hw=2 \
     --use_fsdp_model_ema=0 \
     --use_bit_label=1 \
-    --zero=2 \
+    --zero=3 \
     --save_car_epoch_freq=1 \
     --log_freq=10 \
     --checkpoint_type=torch \
