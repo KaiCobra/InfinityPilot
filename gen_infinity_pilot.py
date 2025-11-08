@@ -181,13 +181,15 @@ def main() -> None:
     infinity_pilot = build_infinity_pilot(args, vae, device)
 
     scale_schedule = list(_prepare_scale_schedule(args))
-    control_tokens = _build_control_tokens(
-        _control_paths_from_args(args),
-        vae,
-        scale_schedule,
-        device,
-        bool(args.apply_spatial_patchify),
-    )
+    control_paths = _control_paths_from_args(args)
+    control_tokens = None
+    if control_paths and infinity_pilot.has_car_modules():
+        control_tokens = _build_control_tokens(
+            control_paths,
+            infinity_pilot,
+            scale_schedule,
+            device,
+        )
 
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
 

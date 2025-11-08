@@ -16,8 +16,6 @@ torchrun \
     --sche=lin0 \
     --fp16=2 \
     --ada=0.9_0.97 \
-    --oeps=1e-6 \
-    --norm_eps=1e-4 \
     --tini=-1 \
     --tclip=5 \
     --flash=0 \
@@ -25,17 +23,18 @@ torchrun \
     --saln=1 \
     --cos=1 \
     --cdec=True \
-    --local_out_path=/mnt/syndata/car_depth4_conv_scale_from_7_lr_04_1_reweight \
+    --enable_checkpointing=full-block \
+    --local_out_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000 \
     --task_type=t2i \
     --bed=/mnt/syndata/VAR_ckpt/checkpoints/pilot \
-    --data_path=/mnt/syndata/car_dataset \
+    --data_path=/mnt/syndata/toy_data/ \
     --video_data_path= \
-    --exp_name=pilot_a6000_conv_6500_$date \
+    --exp_name=pilot_debug_$date \
     --project_name=InfinityPilot \
-    --tblr=5e-4 \
+    --tblr=1e-4 \
     --pn=1M \
     --model=2bc8 \
-    --lbs=6 \
+    --lbs=4 \
     --workers=1 \
     --short_cap_prob=0.0 \
     --online_t5=1 \
@@ -43,11 +42,11 @@ torchrun \
     --iterable_data_buffersize=500 \
     --Ct5=2048 \
     --t5_path=weights/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001 \
-    --rush_resume=weights/mm_2b.pth \
+    --rush_resume=/mnt/syndata/VAR_ckpt/infinity_2b_reg.pth \
     --vae_type=32 \
     --vae_ckpt=weights/infinity_vae_d32_reg.pth \
-    --wp0=0.01 \
-    --wp=0.1 \
+    --wp0=0.1 \
+    --wp=0.0 \
     --wpe=0.05 \
     --dynamic_resolution_across_gpus=1 \
     --enable_dynamic_length_prompt=0 \
@@ -56,10 +55,11 @@ torchrun \
     --rope2d_each_sa_layer=1 \
     --rope2d_normalized_by_hw=2 \
     --use_fsdp_model_ema=0 \
+    --always_training_scales=7 \
     --use_bit_label=1 \
-    --zero=2 \
-    --save_control_epoch_freq=1 \
-    --log_freq=10 \
+    --zero=3 \
+    --save_car_epoch_freq=5 \
+    --log_freq=50 \
     --checkpoint_type=torch \
     --prefetch_factor=2 \
     --noise_apply_strength=0.3 \
@@ -67,28 +67,9 @@ torchrun \
     --apply_spatial_patchify=0 \
     --use_flex_attn=False \
     --pad=128 \
-    --save_control_separately=True \
+    --save_car_separately=True \
     --control_depth=4 \
-    --special_control_init=merge \
-    --disable_control_fusion=False \
-    --disable_control_merge=False \
-    --enable_control_modules=True \
-    --rms_norm=True \
-    --enable_checkpointing=full-block \
-    --enable_dynamic_scales=True \
-    --initial_training_scales 1 \
-    --dynamic_scale_target 13 \
-    --dynamic_scale_patience_transition 10 \
-    --dynamic_scale_patience_low=100 \
-    --dynamic_scale_patience_high=100 \
-    --dynamic_scale_loss_window=100 \
-    --dynamic_scale_loss_delta=0.01 \
-    --control_block_lr_scale 0.4 \
-    --control_fusion_lr_scale 1.0 \
-    # --control_resume_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/control_weights_ep0007_it008000/control_weights.pth \
-    # --enable_checkpointing=0 \
+    --special_car_init=merge \
     # --sync_tensorboard=True,
     # --control_resume_path=None \
     # --debug=False, \
-    # --always_training_scales=10 \
-    

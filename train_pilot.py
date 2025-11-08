@@ -43,12 +43,12 @@ if not enable_timeline_sdk:
     ndtimeline = MockTimeline()
 
 def save_checkpoint_pilot(saver, args, trainer, epoch, iteration, acc_str):
-    """為 InfinityPilot 保存 CAR 權重 (T5風格)"""
-    
+    """為 InfinityPilot 保存控制模組權重 (T5 風格)"""
+
     # 創建保存目錄
-    save_dir = os.path.join(args.local_out_path, f'car_weights_ep{epoch:04d}_it{iteration:06d}')
+    save_dir = os.path.join(args.local_out_path, f'control_weights_ep{epoch:04d}_it{iteration:06d}')
     os.makedirs(save_dir, exist_ok=True)
-    
+
     # 獲取正確的模型對象
     if hasattr(trainer, 'gpt'):
         model = trainer.gpt  # FSDP wrapped model
@@ -56,45 +56,53 @@ def save_checkpoint_pilot(saver, args, trainer, epoch, iteration, acc_str):
         model = trainer.gpt_wo_ddp  # unwrapped model
     else:
         raise AttributeError("Cannot find model in trainer")
-    
-    # 如果當前模型沒有 CAR 模塊，直接跳過保存
+
+    # 如果當前模型沒有控制模組，直接跳過保存
     base_model = model.module if hasattr(model, 'module') else model
-    has_car = getattr(base_model, 'has_car_modules', None)
-    if callable(has_car) and not has_car():
-        print("[warn] CAR modules not initialized; skipping car checkpoint save.")
+    has_control = getattr(base_model, 'has_control_modules', None)
+    if callable(has_control):
+        has_control = has_control()
+    elif hasattr(base_model, 'has_car_modules'):
+        legacy_check = getattr(base_model, 'has_car_modules')
+        has_control = legacy_check() if callable(legacy_check) else False
+    else:
+        has_control = False
+
+    if not has_control:
+        print("[warn] Control modules not initialized; skipping control checkpoint save.")
         return None
 
-    # 分離 CAR 權重
-    car_weights = {}
+    # 分離控制權重
+    control_weights = {}
     infinity_weights = {}
-    
+
     try:
         state_dict = model.state_dict()
     except AssertionError as exc:
-        print(f"[warn] Skipping CAR checkpoint save because state_dict fetch failed: {exc}")
+        print(f"[warn] Skipping control checkpoint save because state_dict fetch failed: {exc}")
         return None
 
     for name, param in state_dict.items():
-        # 檢查是否為 CAR 參數
+        # 檢查是否為 control 參數
         if any(car_prefix in name for car_prefix in ['car_', 'control_']):
-            car_weights[name] = param.cpu()
+            control_weights[name] = param.cpu()
         else:
             infinity_weights[name] = param.cpu()
-    
-    # 只保存 CAR 權重
-    torch.save(car_weights, os.path.join(save_dir, 'car_weights.pth'))
-    
-    # 創建符號鏈接到最新的權重（方便resume）
-    latest_link = os.path.join(args.local_out_path, 'latest_car_weights')
+
+    # 只保存 control 權重
+    torch.save(control_weights, os.path.join(save_dir, 'control_weights.pth'))
+
+    # 創建符號鏈接到最新的權重（方便 resume）
+    latest_link = os.path.join(args.local_out_path, 'latest_control_weights')
     if os.path.islink(latest_link):
         os.unlink(latest_link)
     elif os.path.exists(latest_link):
         os.remove(latest_link)
-    
+
     os.symlink(os.path.basename(save_dir), latest_link)
-    
-    print(f"Saved CAR weights to: {save_dir}")
-    print(f"  CAR parameters: {len(car_weights)}")
+
+    print(f"Saved control weights to: {save_dir}")
+    print(f"  Control parameters: {len(control_weights)}")
     print(f"  Infinity parameters (not saved): {len(infinity_weights)}")
     return save_dir
 
@@ -152,9 +160,9 @@ def build_everything_from_args(args: arg_util.Args, saver):
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
     if auto_resume_info is not None and len(auto_resume_info):
-        # check is there a single CAR weights
-        car_ckpt_path = getattr(args, 'car_resume_path', None)
-        trainer.load_state_dict(trainer_state, strict=False, skip_vae=True, car_ckpt_path=car_ckpt_path)
+        # check if there is a standalone control checkpoint
+        control_ckpt_path = getattr(args, 'control_resume_path', None)
+        trainer.load_state_dict(trainer_state, strict=False, skip_vae=True, control_ckpt_path=control_ckpt_path)
     start_it = start_it % iters_train
     print(f"{start_it=}, {iters_train=}")
     
@@ -202,6 +210,10 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         raise ValueError(f"vae_type {args.vae_type} not supported")
     
     del vae_ckpt
+
+    args.enable_control_modules = getattr(args, 'enable_control_modules', True)
+    args.disable_control_fusion = getattr(args, 'disable_control_fusion', False)
+    args.control_condition_channels = getattr(args, 'control_condition_channels', 3)
     
     # Set scale_schedule from args if not provided
     # if not hasattr(args, 'scale_schedule') or args.scale_schedule is None:
@@ -324,11 +336,9 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         pad_to_multiplier=getattr(args, 'pad_to_multiplier', 1),       # added
         use_flex_attn=args.use_flex_attn,                   # added 
         batch_size=getattr(args, 'batch_size', 4),          # added
-        car_depth=getattr(args, 'car_depth', 16),          # added
-        save_car_separately=getattr(args, 'save_car_separately', True),  # added
-        car_condition_channels=getattr(args, 'car_condition_channels', 3),
-        disable_car_fusion=getattr(args, 'disable_car_fusion', False),
-        disable_car_merge=getattr(args, 'disable_car_merge', False),
+        save_control_separately=getattr(args, 'save_control_separately', True),  # added
+        control_condition_channels=getattr(args, 'control_condition_channels', 3),
+        disable_control_fusion=args.disable_control_fusion,
 
     )
     
@@ -343,17 +353,14 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     # Step 1: Create model without loading weights first
     gpt_wo_ddp = InfinityPilot(
         infinity_base_model=None,  # Don't load weights yet
-        init_car_modules=False,    # Don't init CAR yet
-        freeze_infinity=True,     # Freeze infinity
+        init_control_modules=args.enable_control_modules,
+        freeze_infinity=True,
         **gpt_kw
     )
 
-    if getattr(args, 'disable_car_fusion', False):
-        print("[debug] Disabling CAR fusion as requested.")
-        gpt_wo_ddp.disable_car_fusion = True
-    if getattr(args, 'disable_car_merge', False):
-        print("[debug] Skipping CAR weight merge; using random initialization.")
-        gpt_wo_ddp.disable_car_merge = True
+    if args.disable_control_fusion:
+        print("[debug] Disabling control fusion as requested.")
+        gpt_wo_ddp.disable_control_fusion = True
     
     # Step 2: Load infinity weights if available (memory efficient)
     if infinity_checkpoint is not None:
@@ -370,9 +377,12 @@ def build_model_optimizer_nonused(args, vae_ckpt):
         del infinity_checkpoint
         torch.cuda.empty_cache()
     
-    # Step 3: Initialize CAR modules and freeze infinity
-    gpt_wo_ddp._init_car_modules()
-    gpt_wo_ddp.freeze_infinity_parameters()
+    # Step 3: Initialize control modules and freeze infinity
+    if args.enable_control_modules:
+        gpt_wo_ddp.init_control_modules_if_needed()
+        gpt_wo_ddp.freeze_infinity_parameters()
+    else:
+        print("[INFO] Control modules disabled; training will update Infinity base parameters directly.")
     # Debug console: {(name, p.grad.shape) for name, p in gpt_wo_ddp.named_parameters() if p.grad is not None}
 
     # verify freeze state
@@ -386,16 +396,20 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     if args.tini < 0:
         args.tini = math.sqrt(1 / gpt_wo_ddp.C / 3)
     
-    gpt_kw['car_resume_path'] = getattr(args, 'car_resume_path', None)
-    gpt_kw['special_car_init'] = getattr(args, 'special_car_init', None)
-    if gpt_kw['car_resume_path'] is not None and gpt_kw['car_resume_path'] != '' and gpt_kw['car_resume_path'].lower() != 'none':
-        print(f"Resuming CAR weights from: {gpt_kw['car_resume_path']}")
-        raw_ckpt = torch.load(gpt_kw['car_resume_path'], map_location='cpu', weights_only=False)
+    gpt_kw['control_resume_path'] = getattr(args, 'control_resume_path', None)
+    gpt_kw['special_control_init'] = getattr(args, 'special_control_init', None)
+    if args.enable_control_modules and gpt_kw['control_resume_path'] and gpt_kw['control_resume_path'].lower() != 'none':
+        print(f"Resuming control weights from: {gpt_kw['control_resume_path']}")
+        raw_ckpt = torch.load(gpt_kw['control_resume_path'], map_location='cpu', weights_only=False)
 
-        def _extract_car_state(blob: dict) -> Optional[dict]:
+        def _extract_control_state(blob: dict) -> Optional[dict]:
             if not isinstance(blob, dict):
                 return None
             preferred_keys = (
+                'control_wo_ddp',
+                'control_state',
+                'control_fsdp',
+                'control_ema_fsdp',
                 'car_wo_ddp',
                 'car_state',
                 'car_fsdp',
@@ -404,30 +418,40 @@ def build_model_optimizer_nonused(args, vae_ckpt):
             for key in preferred_keys:
                 if key in blob and blob[key]:
                     return blob[key]
-            subset = {k: v for k, v in blob.items() if any(k.startswith(prefix) for prefix in ('car_', 'control_'))}
+            subset = {k: v for k, v in blob.items() if any(k.startswith(prefix) for prefix in ('control_', 'car_'))}
             return subset if subset else None
 
-        car_state = _extract_car_state(raw_ckpt)
-        if car_state is None and isinstance(raw_ckpt, dict):
-            car_state = _extract_car_state(raw_ckpt.get('trainer', {}))
+        control_state = _extract_control_state(raw_ckpt)
+        if control_state is None and isinstance(raw_ckpt, dict):
+            control_state = _extract_control_state(raw_ckpt.get('trainer', {}))
 
-        if car_state is None:
+        if control_state is None:
             raise RuntimeError(
-                "Provided CAR resume checkpoint does not contain recognizable car_* weights: "
-                f"{gpt_kw['car_resume_path']}"
+                "Provided control resume checkpoint does not contain recognizable control_* weights: "
+                f"{gpt_kw['control_resume_path']}"
             )
 
-        if any('._fsdp_wrapped_module.' in k for k in car_state.keys()):
-            print('[car-resume] Detected FSDP-format CAR weights; converting to standard format...')
-            car_state = gpt_wo_ddp._convert_fsdp_to_standard_format(car_state)
-            car_state = {k: v for k, v in car_state.items() if any(k.startswith(prefix) for prefix in ('car_', 'control_'))}
+        if any('._fsdp_wrapped_module.' in k for k in control_state.keys()):
+            print('[control-resume] Detected FSDP-format control weights; converting to standard format...')
+            control_state = gpt_wo_ddp._convert_fsdp_to_standard_format(control_state)
+            control_state = {k: v for k, v in control_state.items() if any(k.startswith(prefix) for prefix in ('control_', 'car_'))}
 
-        gpt_wo_ddp.load_car_weights(car_state)
+        gpt_wo_ddp.load_control_weights(control_state)
+        if args.special_control_init:
+            init_hook = getattr(gpt_wo_ddp, 'special_control_init', None)
+            if callable(init_hook):
+                print(f"[EXTRA INIT] Applying special_control_init={args.special_control_init}")
+                init_hook(args)
+            elif hasattr(gpt_wo_ddp, 'special_car_init'):
+                print(f"[EXTRA INIT] Falling back to legacy special_car_init={args.special_control_init}")
+                gpt_wo_ddp.special_car_init(args)
         del raw_ckpt
         torch.cuda.empty_cache()
-    else:
-        # Use default CAR initialization (simple Xavier)
-        print("Didn't load CAR weights; using default initialization.")
+    elif args.enable_control_modules:
+        # Use default control initialization (simple Xavier)
+        print("Didn't load control weights; using default initialization.")
+    elif gpt_kw['control_resume_path']:
+        print("[WARN] control_resume_path provided but control modules are disabled; ignoring checkpoint.")
     
     # Update word embedding settings if needed
     if args.rwe:
@@ -437,7 +461,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
             gpt_wo_ddp.word_embed.bias.requires_grad = False
             gpt_wo_ddp.word_embed.bias.data.zero_()
     
-    # Only count CAR parameters for training (過濾掉凍結的參數)
+    # Only count control parameters for training (過濾掉凍結的參數)
     # 只為 requires_grad=True 的參數創建 ndim_dict
     ndim_dict = {name: para.ndim for name, para in gpt_wo_ddp.named_parameters() if para.requires_grad}
     
@@ -450,7 +474,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     )]))
     print(f'[PT][#para] GPT total={count_p(gpt_wo_ddp)}, trainable={count_trainable_p(gpt_wo_ddp)}')
     
-    # 計算 Infinity 和 CAR 參數數量
+    # 計算 Infinity 和控制參數數量
     debug_parameter_number(gpt_wo_ddp)
 
     gpt_uncompiled = gpt_wo_ddp
@@ -460,7 +484,7 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     gpt_wo_ddp = gpt_wo_ddp.to(args.device)
     print(f"Model moved to device: {args.device}")
 
-    # For InfinityPilot with frozen base model, EMA is usually not needed for CAR training
+    # For InfinityPilot with frozen base model, EMA is usually not needed for control training
     gpt_wo_ddp_ema = None
     gpt_ddp_ema = None
     
@@ -498,50 +522,49 @@ def build_model_optimizer_nonused(args, vae_ckpt):
             device_mesh=device_mesh,
         ).to(args.device)
         
-        # For InfinityPilot CAR training, we typically don't need EMA since base model is frozen
+        # For InfinityPilot control training, we typically don't need EMA since base model is frozen
         if args.use_fsdp_model_ema:
-            print("[INFO] FSDP EMA disabled for InfinityPilot CAR training (base model is frozen)")
-            # Optionally, you can enable EMA for CAR modules only if needed:
+            print("[INFO] FSDP EMA disabled for InfinityPilot control training (base model is frozen)")
+            # Optionally, you can enable EMA for control modules only if needed:
             # gpt_wo_ddp_ema = copy.deepcopy(gpt_wo_ddp)
             # gpt_ddp_ema: FSDP = FSDP(gpt_wo_ddp_ema, ...)
     else:
         ddp_class = DDP if dist.initialized() else misc.NullDDP
         # Enable find_unused_parameters for InfinityPilot with frozen base model
-        find_unused = True  # Always enable for InfinityPilot CAR training
+        find_unused = True  # Always enable for InfinityPilot control training
         gpt_ddp: DDP = ddp_class(gpt_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=find_unused, broadcast_buffers=False)
     torch.cuda.synchronize()
     
-    # 重要：DDP 包装後重新確保凍結狀態
-    print("[DEBUG] Re-verifying and enforcing freeze status after DDP wrapping:")
-    base_model = gpt_ddp.module if hasattr(gpt_ddp, 'module') else gpt_ddp
-    
-    # 强制重新冻结 Infinity 参数
-    frozen_count = 0
-    for name, param in base_model.named_parameters():
-        if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
-            if param.requires_grad:
-                param.requires_grad = False
-                frozen_count += 1
-    
-    if frozen_count > 0:
-        print(f"  Re-frozen {frozen_count} Infinity parameters after DDP wrapping")
-    
-    # 验证最终状态
-    debug_parameter_freeze_status(base_model)
+    if args.enable_control_modules:
+        # 重要：DDP 包装後重新確保凍結狀態
+        print("[DEBUG] Re-verifying and enforcing freeze status after DDP wrapping:")
+        base_model = gpt_ddp.module if hasattr(gpt_ddp, 'module') else gpt_ddp
+        
+        # 强制重新冻结 Infinity 参数
+        frozen_count = 0
+        for name, param in base_model.named_parameters():
+            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
+                if param.requires_grad:
+                    param.requires_grad = False
+                    frozen_count += 1
+        
+        if frozen_count > 0:
+            print(f"  Re-frozen {frozen_count} Infinity parameters after DDP wrapping")
+        
+        # 验证最终状态
+        debug_parameter_freeze_status(base_model)
 
     # =============== build optimizer ===============
     # 創建一個只包含可訓練參數的模型包裝器，以避免 filter_params 中的 names_no_grad 斷言錯誤
     class TrainableParametersWrapper:
-        """只包含可訓練參數的模型包裝器"""
-        def __init__(self, model, prefixes_to_ignore: Optional[List[str]] = ['car_', 'control_']):
+        """只包含可訓練參數的模型包裝器，可選擇依名稱過濾。"""
+        def __init__(self, model, prefixes_to_include: Optional[List[str]] = None):
             self.model = model
-            self.prefixes_to_ignore = prefixes_to_ignore if prefixes_to_ignore is not None else []
-            # self._trainable_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
             self._trainable_params = []
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
-                if any(pfx in  name for pfx in self.prefixes_to_ignore):
+                if prefixes_to_include is None or any(pfx in name for pfx in prefixes_to_include):
                     self._trainable_params.append((name, param))
             
         def named_parameters(self):
@@ -552,18 +575,20 @@ def build_model_optimizer_nonused(args, vae_ckpt):
             return getattr(self.model, name)
     
     # 使用包裝器來只處理可訓練的參數
-    trainable_model_wrapper = TrainableParametersWrapper(gpt_ddp if args.zero else gpt_wo_ddp,
-                                                         prefixes_to_ignore=['car_', 'control_'])
+    include_prefixes = ['control_'] if args.enable_control_modules else None
+    trainable_model_wrapper = TrainableParametersWrapper(
+        gpt_ddp if args.zero else gpt_wo_ddp,
+        prefixes_to_include=include_prefixes,
+    )
     
     nowd_keys = set()
     _temp_ = args.nowd 
-    if args.nowd >= 1:
+    if args.nowd >= 1 and args.enable_control_modules:
         # 只包含實際存在於可訓練參數中的 no weight decay 參數
         nowd_keys |= {
-            # CAR 相關的參數
-            'car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates',
-             'car_skip_norm', 'car_skip_linear',
-            # 一些通用的參數（如果它們在 CAR 模塊中）
+        # 控制模組相關的參數
+            'control_encoder', 'control_scale_gate_mlp', 'control_scale_gate_bias', 'control_token_norm', 'control_block_gates',
+        # 一些通用的參數（如果它們在控制模塊中）
             'gamma', 'beta', 'bias',
         }
     if args.nowd >= 2:
@@ -585,8 +610,49 @@ def build_model_optimizer_nonused(args, vae_ckpt):
     opt_kw = dict(lr=args.tlr, weight_decay=0)
     if args.oeps: opt_kw['eps'] = args.oeps
     print(f'[vgpt] optim={opt_clz}, opt_kw={opt_kw}\n')
-    for group in para_groups:
-        group['lr_sc'] = group.get('lr_sc', 1.0) * args.car_lr_scale
+
+    name_by_param_id = {id(param): name for name, param in zip(names, paras)}
+
+    def _split_group(group):
+        base_params, block_params, fusion_params = [], [], []
+        for param in group['params']:
+            pname = name_by_param_id.get(id(param))
+            if pname is None:
+                base_params.append(param)
+                continue
+            if pname.startswith('control_blocks'):
+                block_params.append(param)
+            elif pname.startswith(('control_encoder', 'control_token_norm', 'control_scale_gate_mlp', 'control_scale_gate_bias', 'control_block_gates')):
+                fusion_params.append(param)
+            else:
+                base_params.append(param)
+        return base_params, block_params, fusion_params
+
+    if args.enable_control_modules:
+        expanded_groups = []
+        for group in para_groups:
+            base_params, block_params, fusion_params = _split_group(group)
+            base_lr_scale = group.get('lr_sc', 1.0) * args.control_lr_scale
+
+            if base_params:
+                new_group = dict(group)
+                new_group['params'] = base_params
+                new_group['lr_sc'] = base_lr_scale
+                expanded_groups.append(new_group)
+
+            if block_params:
+                new_group = dict(group)
+                new_group['params'] = block_params
+                new_group['lr_sc'] = base_lr_scale * args.control_block_lr_scale
+                expanded_groups.append(new_group)
+
+            if fusion_params:
+                new_group = dict(group)
+                new_group['params'] = fusion_params
+                new_group['lr_sc'] = base_lr_scale * args.control_fusion_lr_scale
+                expanded_groups.append(new_group)
+
+        para_groups = expanded_groups
 
     gpt_optim = AmpOptimizer('gpt',
                               args.fp16,
@@ -706,9 +772,9 @@ def main_train(args: arg_util.Args):
             print(f'[PT info]  from ep{start_ep} it{start_it}, acc_str: {acc_str}, diffs: {args.diffs},    =======>  bed: {args.bed}  <=======\n')
         
         # [save checkpoint]
-        save_car_epoch_freq = getattr(args, 'save_car_epoch_freq', 1)  # 預設值為 1
-        save_car_step_freq = getattr(args, 'save_car_step_freq', 0)
-        if save_car_step_freq <= 0 and save_car_epoch_freq > 0 and dist.is_master() and ep != 0 and ep % save_car_epoch_freq == 0:
+        save_control_epoch_freq = getattr(args, 'save_control_epoch_freq', 1)  # 預設值為 1
+        save_control_step_freq = getattr(args, 'save_control_step_freq', 0)
+        if save_control_step_freq <= 0 and save_control_epoch_freq > 0 and dist.is_master() and ep != 0 and ep % save_control_epoch_freq == 0:
             with misc.Low_GPU_usage(files=[args.log_txt_path], sleep_secs=3, verbose=True):
             # 使用我們的 save_checkpoint_pilot 函數
                 save_checkpoint_pilot(
@@ -920,7 +986,7 @@ def train_one_ep(
                     condition_inputs['normal'] = condition_normal
             if condition_mask is not None:
                 condition_mask = condition_mask.to(args.device, non_blocking=True)
-                if args.car_mask_drop_prob > 0 and random.random() < args.car_mask_drop_prob:
+                if args.control_mask_drop_prob > 0 and random.random() < args.control_mask_drop_prob:
                     condition_mask = None
                 if condition_mask is not None:
                     condition_inputs['mask'] = condition_mask
@@ -987,8 +1053,8 @@ def train_one_ep(
                 print(f"[DynamicScale] Increased training scales to {scale_update} at global step {g_it}.")
                 log_metrics({'train/training_scales': scale_update}, step=g_it)
 
-            save_car_step_freq = getattr(args, 'save_car_step_freq', 0)
-            if save_car_step_freq > 0 and dist.is_master() and (g_it + 1) % save_car_step_freq == 0:
+            save_control_step_freq = getattr(args, 'save_control_step_freq', 0)
+            if save_control_step_freq > 0 and dist.is_master() and (g_it + 1) % save_control_step_freq == 0:
                 acc_str = (
                     f"Lm:{me.meters['Lm'].global_avg:.3f}_"
                     f"Lt:{me.meters['Lt'].global_avg:.3f}_"

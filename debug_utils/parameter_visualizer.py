@@ -12,7 +12,7 @@ warnings.filterwarnings('ignore')
 
 class ParameterChangeVisualizer:
     """
-    可視化模型參數變化的工具，特別針對 InfinityPilot CAR 訓練
+    可視化模型參數變化的工具，特別針對 InfinityPilot control 訓練
     """
     def __init__(self, model, save_dir="./param_visualizations"):
         self.model = model
@@ -32,10 +32,9 @@ class ParameterChangeVisualizer:
         # 定義模組分組
         self.module_groups = {
             'Infinity_Embedding': ['word_embed', 'pos_start', 'pos_1LC', 'lvl_embed'],
-            'CAR_Control': ['car_control_proj'],
-            'CAR_Blocks': ['car_blocks'],
-            'CAR_Fusion': ['car_fusion_linears', 'car_fusion_gates'],
-            'CAR_Others': ['car_'],
+            'Control_Encoder': ['control_encoder', 'control_token_norm', 'car_control_encoder', 'car_control_norm'],
+            'Control_Gates': ['control_scale_gate_mlp', 'control_scale_gate_bias', 'control_block_gates', 'car_scale_gate_mlp', 'car_scale_gate_bias', 'car_block_fusion_gates'],
+            'Control_Others': ['control_', 'car_'],
             'Infinity_Blocks': ['blocks'],
             'Infinity_Input': ['head_nm', 'head'],
             
