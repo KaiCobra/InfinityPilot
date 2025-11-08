@@ -205,8 +205,17 @@ class InfinityPilotTrainer(object):
         if hasattr(gpt_uncompiled, 'has_car_modules'):
             assert gpt_uncompiled.has_car_modules(), "CAR modules must be initialized before constructing the trainer"
         
+<<<<<<< ours
         self._car_gradient_setup = False
         self._setup_car_parameter_gradients()
+=======
+        self._control_gradient_setup = False
+        self._setup_control_parameter_gradients()
+<<<<<<< ours
+        self._control_token_cache: Dict[str, Any] = {'key': None, 'tokens': None}
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 
         # Print parameter counts (after gradient setup to reflect actual trainable stats)
         car_params = sum(p.numel() for p in gpt_uncompiled.get_car_parameters() if p.requires_grad)
@@ -593,6 +602,7 @@ class InfinityPilotTrainer(object):
             gt_ms_idx_Bl = gt_ms_idx_Bl[:available_scales]
             
             full_control_tokens = None
+<<<<<<< ours
             raw_features_condition_mask = None
             raw_features_condition_normal = None
             if condition_inputs:
@@ -612,6 +622,10 @@ class InfinityPilotTrainer(object):
                     control_tokens_by_type['normal'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_normal)
                 if control_tokens_by_type:
                     full_control_tokens = self._combine_control_tokens(control_tokens_by_type, len(full_scale_schedule))
+=======
+            if condition_inputs:
+                full_control_tokens = self._build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
+>>>>>>> theirs
             
             scale_limit = min(self.base_training_scale_limit, available_scales)
             training_scales = min(scale_limit, self.active_training_scales)
@@ -708,6 +722,7 @@ class InfinityPilotTrainer(object):
             return None
         control_tokens_by_type = {}
         with torch.no_grad():
+<<<<<<< ours
             if condition_inputs.get('mask') is not None:
                 mask = condition_inputs['mask']
                 raw_features_mask, _, _ = self.vae_local.encode_for_raw_features(mask, scale_schedule=vae_scale_schedule)
@@ -720,6 +735,7 @@ class InfinityPilotTrainer(object):
             return None
         return self._combine_control_tokens(control_tokens_by_type, training_scales)
 
+<<<<<<< ours
     @staticmethod
     def _combine_control_tokens(control_tokens_by_type: Dict[str, List[torch.Tensor]], training_scales: int):
         if not control_tokens_by_type:
@@ -740,6 +756,25 @@ class InfinityPilotTrainer(object):
                 control_tokens.append(None)
         return control_tokens
     
+=======
+    def _get_or_build_control_tokens(self, condition_inputs, scale_schedule, training_scales):
+        if condition_inputs is None or len(condition_inputs) == 0:
+            return None
+        cache_key = self._make_condition_cache_key(condition_inputs, scale_schedule[:training_scales] if training_scales is not None else scale_schedule)
+        if cache_key is not None and self._control_token_cache.get('key') == cache_key:
+            return self._control_token_cache.get('tokens')
+        tokens = self._build_control_tokens(condition_inputs, scale_schedule, training_scales)
+        if cache_key is not None and tokens is not None:
+            cached_tokens = [None if t is None else t.detach() for t in tokens]
+            self._control_token_cache = {'key': cache_key, 'tokens': cached_tokens}
+            return cached_tokens
+        return tokens
+
+>>>>>>> theirs
+=======
+            return model.build_control_tokens_from_inputs(condition_inputs, target_schedule)
+
+>>>>>>> theirs
     @staticmethod
     def _slice_text_cond_for_eval(text_tuple, index: int) -> Optional[Tuple[torch.Tensor, List[int], torch.Tensor, int]]:
         if not isinstance(text_tuple, tuple) or len(text_tuple) != 4:
@@ -788,9 +823,12 @@ class InfinityPilotTrainer(object):
         #     print(f"❌ [it={it}] Inf in input inp_B3HW!")
         
         with self.gpt_opt.amp_ctx:
+<<<<<<< ours
             # with torch.amp.autocast('cuda', enabled=False):
             raw_features_condition_mask = None
             raw_features_condition_normal = None
+=======
+>>>>>>> theirs
             with torch.no_grad():
                 if args.apply_spatial_patchify:
                     full_vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in full_scale_schedule]
@@ -798,6 +836,7 @@ class InfinityPilotTrainer(object):
                     full_vae_scale_schedule = full_scale_schedule
                 vae_scale_schedule = full_vae_scale_schedule
                 raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=vae_scale_schedule)
+<<<<<<< ours
                 # take out normal map and text mask condition if exists
                 # print('condition_inputs:', condition_inputs)
                 if condition_inputs is not None:
@@ -809,10 +848,13 @@ class InfinityPilotTrainer(object):
                         raw_features_condition_normal, _, _ = self.vae_local.encode_for_raw_features(condition_normal, scale_schedule=vae_scale_schedule)
 
 
+=======
+>>>>>>> theirs
 
             x_BLC_wo_prefix, gt_ms_idx_Bl = self.bitwise_self_correction.flip_requant(vae_scale_schedule, inp_B3HW, raw_features, device)
             if should_visualize_batch:
                 full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl]
+<<<<<<< ours
             control_tokens_by_type = {}
             if raw_features_condition_mask is not None:
                 control_tokens_by_type['mask'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_mask)
@@ -821,6 +863,11 @@ class InfinityPilotTrainer(object):
             full_control_tokens = None
             if control_tokens_by_type:
                 full_control_tokens = self._combine_control_tokens(control_tokens_by_type, len(full_scale_schedule))
+=======
+            full_control_tokens = None
+            if condition_inputs:
+                full_control_tokens = self._build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
+>>>>>>> theirs
 
             # truncate scales
             available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl))
@@ -830,10 +877,23 @@ class InfinityPilotTrainer(object):
                 raise RuntimeError("No valid scales available; check VAE outputs or dynamic resolution settings.")
             self.last_training_scales = training_scales
             scale_schedule = full_scale_schedule[:training_scales]
+<<<<<<< ours
+<<<<<<< ours
+=======
+>>>>>>> theirs
             gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
             control_tokens = None
             if full_control_tokens is not None:
                 control_tokens = full_control_tokens[:training_scales]
+<<<<<<< ours
+=======
+            gt_ms_idx_Bl = gt_ms_idx_Bl_full[:training_scales]
+            control_tokens = self._get_or_build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
+            if control_tokens is not None:
+                control_tokens = control_tokens[:training_scales]
+>>>>>>> theirs
+=======
+>>>>>>> theirs
             training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
             x_BLC_wo_prefix = x_BLC_wo_prefix[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
 
@@ -943,9 +1003,24 @@ class InfinityPilotTrainer(object):
 
         # [zero_grad]
         if stepping:
+<<<<<<< ours
+<<<<<<< ours
             grad_stats = {}
              # 梯度監控
             if dist.is_master(): # 只在主進程執行
+=======
+            self._control_token_cache = {'key': None, 'tokens': None}
+<<<<<<< ours
+            log_grad_monitor = self.grad_monitor_enabled and (g_it % self.grad_monitor_interval == 0)
+            if log_grad_monitor and dist.is_master(): # 只在主進程執行
+>>>>>>> theirs
+=======
+=======
+>>>>>>> theirs
+            grad_stats = {}
+             # 梯度監控
+            if dist.is_master(): # 只在主進程執行
+>>>>>>> theirs
                 import matplotlib.pyplot as plt
                 import seaborn as sns
                 import pandas as pd

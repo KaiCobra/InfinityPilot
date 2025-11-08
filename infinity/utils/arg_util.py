@@ -77,8 +77,16 @@ class Args(Tap):
     ca_gamma: float = -1                # >=0 for using layer-scale for cross attention
     diva: int = 1                       # rescale_attn_fc_weights
     hd0: float = 0.02                   # head.w *= hd0
+<<<<<<< ours
     car_lr_scale: float = 0.5           # learning-rate multiplier applied to CAR params
     car_scale_reg: float = 5e-03        # L2 regularization weight for car_skip_scale
+=======
+    control_lr_scale: float = 1.0       # learning-rate multiplier applied to control params
+    control_fusion_lr_scale: float = 0.1  # learning-rate multiplier applied to control fusion params
+    control_block_lr_scale: float = 10.0  # learning-rate multiplier applied to control block params
+    control_scale_reg: float = 5e-03    # L2 regularization weight for control skip_scale
+    enable_control_modules: bool = True # whether to build/use control modules
+>>>>>>> theirs
     min_warmup_iters: int = 2048        # minimum warmup iterations (in steps)
     car_condition_channels: int = 6     # number of channels for CAR condition input (normal map + mask)
     car_mask_drop_prob: float = 0.1     # prob of dropping mask input (use normal map only)
@@ -249,6 +257,15 @@ class Args(Tap):
     prof_freq: int = 50     # profile
     tos_profiler_file_prefix: str = 'vgpt_default/'
     profall: int = 0
+<<<<<<< ours
+=======
+    def process_args(self):
+        processed = super().process_args()
+        for legacy_attr, canonical_attr in _CONTROL_ATTRIBUTE_ALIASES.items():
+            setattr(processed, legacy_attr, getattr(processed, canonical_attr))
+        return processed
+
+>>>>>>> theirs
     @property
     def is_vae_visualization_only(self) -> bool:
         return self.v_seed > 0
