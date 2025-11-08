@@ -81,11 +81,9 @@ class MultipleLayers(nn.Module):
         for i in range(index, index+num_blocks_in_a_chunk):
             self.module.append(ls[i])
 
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, checkpointing_full_block=False, rope2d_freqs_grid=None, fusion_callback=None, block_offset=0):
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, checkpointing_full_block=False, rope2d_freqs_grid=None):
         h = x
-        for local_idx, m in enumerate(self.module):
-            if fusion_callback is not None:
-                h = fusion_callback(block_offset + local_idx, h)
+        for m in self.module:
             if checkpointing_full_block:
                 h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
@@ -99,63 +97,18 @@ class FP32_Layernorm(nn.LayerNorm):
                             self.eps).to(origin_dtype)
 
 
-class InfinityPilot(Infinity):
+class InfinityRES(Infinity):
     """
-    ## 🧑‍🚀InfinityPilot: surf beyond the infinity!🛰️
+    ## 🧑‍🚀InfinityRES: surf beyond the infinity!🛰️
     This is a variant of Infinity that can refer to the condition image and prompt text to generate images that imply to the conditions.
     
     Like the ControlNet for diffusion models, it can be used to control the generation process.
-
-    Args:
-        vae_local: VAE model or module used for image encoding/decoding.
-        text_channels (int, default=0): Number of text channels for text-conditioned generation.
-        text_maxlen (int, default=0): Maximum length of text input.
-        selecting_idx (Optional[int], default=None): Index for class-conditioned generation.
-        embed_dim (int, default=1024): Embedding dimension of the model.
-        depth (int, default=16): Number of transformer blocks (model depth).
-        num_heads (int, default=16): Number of attention heads.
-        mlp_ratio (float, default=4.0): Ratio of MLP hidden dimension to embedding dimension.
-        drop_rate (float, default=0.0): Dropout rate for regularization.
-        drop_path_rate (float, default=0.0): Drop path rate for stochastic depth.
-        norm_eps (float, default=1e-6): Epsilon value for normalization layers.
-        rms_norm (bool, default=False): If True, use RMSNorm instead of LayerNorm.
-        shared_aln (bool, default=False): If True, use shared adaptive layer normalization.
-        head_aln (bool, default=True): If True, use adaptive normalization in attention heads.
-        cond_drop_rate (float, default=0.1): Drop rate for classifier-free guidance.
-        rand_uncond (bool, default=False): If True, randomly use unconditional generation.
-        cross_attn_layer_scale (float, default=-1.0): Scaling factor for cross-attention layers.
-        nm0 (bool, default=False): Custom normalization flag.
-        tau (float, default=1): Temperature parameter for attention or sampling.
-        cos_attn (bool, default=True): If True, use cosine attention mechanism.
-        swiglu (bool, default=False): If True, use SwiGLU activation in MLPs.
-        raw_scale_schedule (tuple, default=(1,2,3,4,5,6,8,10,13,16)): Schedule for raw scaling across layers.
-        head_depth (int, default=1): Depth of the attention head module.
-        top_p (float, default=0.0): Nucleus sampling parameter (top-p).
-        top_k (float, default=0.0): Top-k sampling parameter.
-        customized_flash_attn (bool, default=False): If True, use customized FlashAttention.
-        fused_mlp (bool, default=False): If True, use fused MLP implementation.
-        fused_norm (bool, default=False): If True, use fused normalization implementation.
-        block_chunks (int, default=1): Number of chunks to split blocks for memory efficiency.
-        checkpointing (Optional[Any], default=None): Checkpointing strategy for memory saving.
-        pad_to_multiplier (int, default=0): Pad input to a multiple of this value.
-        use_flex_attn (bool, default=False): If True, use flexible attention mechanism.
-        batch_size (int, default=2): Batch size for training or inference.
-        add_lvl_embeding_only_first_block (int, default=1): If True, add level embedding only in the first block.
-        use_bit_label (int, default=1): If True, use bit-level labels.
-        rope2d_each_sa_layer (int, default=0): If True, apply 2D RoPE to each self-attention layer.
-        rope2d_normalized_by_hw (int, default=0): If True, normalize 2D RoPE by height/width.
-        pn (Optional[Any], default=None): Additional parameter, purpose defined by implementation.
-        train_h_div_w_list (Optional[list], default=None): List of height/width ratios for training.
-        video_frames (int, default=1): Number of video frames for video input.
-        always_training_scales (int, default=20): Number of scales always used during training.
-        apply_spatial_patchify (int, default=0): If True, apply spatial patchification.
-        inference_mode (bool, default=False): If True, set model to inference mode.
     """
-    def __init__(self, infinity_base_model: Optional['Infinity'] = None, init_control_modules=False, init_car_modules=None, freeze_infinity=True, **kwargs):
+    def __init__(self, infinity_base_model: Optional['Infinity'] = None, init_car_modules=False, freeze_infinity=True, **kwargs):
         """
         Args:
             infinity_base_model: 預訓練的 Infinity 基礎模型，如果提供則會復制其參數
-            init_control_modules: 是否初始化控制模塊
+            init_car_modules: 是否初始化 CAR 模塊
             freeze_infinity: 是否凍結 Infinity 基礎模型的參數
             **kwargs: 其他參數傳遞給 Infinity 父類
         """
@@ -186,37 +139,17 @@ class InfinityPilot(Infinity):
             else:
                 print(f"[InfinityPilot] Could not detect ada_lin format, using default shared_aln={kwargs.get('shared_aln', False)}")
         
-        if 'disable_control_fusion' not in kwargs and 'disable_car_fusion' in kwargs:
-            kwargs['disable_control_fusion'] = kwargs.pop('disable_car_fusion')
-        else:
-            kwargs.pop('disable_car_fusion', None)
-
-        if 'control_condition_channels' not in kwargs and 'car_condition_channels' in kwargs:
-            kwargs['control_condition_channels'] = kwargs.pop('car_condition_channels')
-        else:
-            kwargs.pop('car_condition_channels', None)
-
-        legacy_init_flag = kwargs.pop('init_control_modules', None)
-
         # 保存所需的參數以便在建立控制塊時使用
         self._init_kwargs = kwargs.copy()
+        self.car_condition_channels = kwargs.get('car_condition_channels', 3)
         
-        print(f"[InfinityPilot] Initializing with shared_aln={kwargs.get('shared_aln', False)}")
+        print(f"[InfinityRES] Initializing with shared_aln={kwargs.get('shared_aln', False)}")
 
         # super().__init__(**kwargs)
         sig = inspect.signature(super().__init__)
         valid_keys = sig.parameters.keys()
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
         super().__init__(**filtered_kwargs)
-        self.disable_control_fusion = kwargs.get('disable_control_fusion', False)
-        self.control_condition_channels = kwargs.get('control_condition_channels', 6)
-        self.control_runtime_dtype = self._infer_control_runtime_dtype()
-        self.control_autocast_dtype = (
-            torch.bfloat16 if self.control_runtime_dtype == torch.bfloat16
-            else torch.float16 if self.control_runtime_dtype == torch.float16
-            else torch.bfloat16 if torch.cuda.is_available() else None
-        )
-        self.control_storage_dtype = self.control_autocast_dtype or self.control_runtime_dtype
         
         self.num_block_chunks = kwargs.get('block_chunks', 1)
         
@@ -226,39 +159,12 @@ class InfinityPilot(Infinity):
         # 凍結 Infinity 基礎模型參數
         if freeze_infinity:
             self.freeze_infinity_parameters()
-
-        if legacy_init_flag is not None:
-            init_control_modules = legacy_init_flag
-        elif init_car_modules is not None:
-            init_control_modules = init_car_modules
-
-        if init_control_modules:
-            self._init_control_modules()
-
-        print("🔍 NaN detector registered on all normalization layers")
-
-    def _infer_control_runtime_dtype(self) -> torch.dtype:
-        """Best-effort inference of dtype for control tensors, covering checkpoints without pos_1LC."""
-        candidates = (
-            getattr(self, 'pos_1LC', None),
-            getattr(self, 'pos_start', None),
-            getattr(self, 'lvl_embed', None),
-            getattr(self, 'word_embed', None),
-            getattr(self, 'norm0_ve', None),
-        )
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            if isinstance(candidate, torch.Tensor):
-                return candidate.dtype
-            if isinstance(candidate, nn.Module):
-                if hasattr(candidate, 'weight') and isinstance(candidate.weight, torch.Tensor):
-                    return candidate.weight.dtype
-        print("[control_init] Warning: could not infer base dtype; defaulting control runtime dtype to float32.")
-        return torch.float32
-
+        
+        if init_car_modules:
+            self._init_res_modules()
+    
     def load_infinity_weights(self, infinity_model_or_state_dict):
-        """從預訓練的 Infinity 模型載入權重，只載入非控制模塊"""
+        """從預訓練的 Infinity 模型載入權重，只載入非CAR模塊"""
         if isinstance(infinity_model_or_state_dict, dict):
             infinity_state_dict = infinity_model_or_state_dict
         else:
@@ -269,21 +175,21 @@ class InfinityPilot(Infinity):
             print("[INFO] Detected FSDP format weights, converting to standard format...")
             infinity_state_dict = self._convert_fsdp_to_standard_format(infinity_state_dict)
         
-        # 過濾出只有Infinity基礎模型的權重（排除控制相關）
+        # 過濾出只有Infinity基礎模型的權重（排除CAR相關）
         filtered_dict = {}
         for name, param in infinity_state_dict.items():
-            # 跳過控制相關的參數
+            # 跳過CAR相關的參數
             if self._is_car_parameter(name):
                 continue
             filtered_dict[name] = param
         
-        # 獲取當前模型的非控制參數名稱用於調試
+        # 獲取當前模型的非CAR參數名稱用於調試
         current_infinity_params = {name for name, _ in self.named_parameters() 
                                  if not self._is_car_parameter(name)}
         source_infinity_params = set(filtered_dict.keys())
 
-        # sorted_source_infinity_params = sorted(source_infinity_params)
-        # sorted_current_infinity_params = sorted(current_infinity_params)
+        sorted_source_infinity_params = sorted(source_infinity_params)
+        sorted_current_infinity_params = sorted(current_infinity_params)
 
         # 調試信息：檢查哪些參數缺失
         missing_in_target = source_infinity_params - current_infinity_params
@@ -306,7 +212,7 @@ class InfinityPilot(Infinity):
         # 載入基礎模型權重
         missing_keys, unexpected_keys = self.load_state_dict(filtered_dict, strict=False)
         
-        # 過濾掉控制相關的missing keys（這些是正常的）
+        # 過濾掉CAR相關的missing keys（這些是正常的）
         real_missing = [k for k in missing_keys if not self._is_car_parameter(k)]
         
         # 統計不同類型的缺失參數
@@ -338,7 +244,7 @@ class InfinityPilot(Infinity):
         return real_missing, unexpected_keys
 
     def save_separated_weights(self, save_dir):
-        """分別保存Infinity基礎權重和控制權重，T5風格"""
+        """分別保存Infinity基礎權重和CAR權重，T5風格"""
         import os
         os.makedirs(save_dir, exist_ok=True)
         
@@ -358,7 +264,7 @@ class InfinityPilot(Infinity):
         
         print(f"Saved separated weights:")
         print(f"  Infinity base: {len(infinity_weights)} parameters")
-        print(f"  Control modules: {len(car_weights)} parameters")
+        print(f"  CAR modules: {len(car_weights)} parameters")
         return save_dir
 
     def _convert_fsdp_to_standard_format(self, fsdp_state_dict):
@@ -412,33 +318,17 @@ class InfinityPilot(Infinity):
         fsdp_state_dict.clear()
         return converted_dict
 
-    def _is_control_parameter(self, param_name: str) -> bool:
-        """判斷參數是否屬於控制模組"""
-        control_prefixes = ['control_']
-        return any(param_name.startswith(prefix) for prefix in control_prefixes)
-
-    # backward compatibility for legacy calls
     def _is_car_parameter(self, param_name):
-        return self._is_control_parameter(param_name)
-    
-    def _assert_finite(self, name: str, tensor: torch.Tensor):
-        if tensor is None:
-            return
-        if torch.isfinite(tensor).all():
-            return
-        bad_mask = ~torch.isfinite(tensor)
-        bad_index = bad_mask.nonzero(as_tuple=False)[0]
-        sample = tensor[tuple(bad_index.tolist())].item()
-        raise FloatingPointError(
-            f"[NaN detector] {name} contains non-finite values "
-            f"(first bad index {bad_index.tolist()}, sample={sample})"
-        )
+        """判斷參數是否屬於CAR模塊"""
+        car_prefixes = ['car_', 'control_']
+        return any(param_name.startswith(prefix) for prefix in car_prefixes)
     
     def freeze_infinity_parameters(self):
         """凍結 Infinity 基礎模型的參數"""
         frozen_count = 0
         for name, param in self.named_parameters():
-            if not self._is_control_parameter(name):
+            # 不凍結 CAR 相關的參數
+            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
                 param.requires_grad = False
                 frozen_count += 1
         print(f"Frozen {frozen_count} Infinity base model parameters")
@@ -447,263 +337,227 @@ class InfinityPilot(Infinity):
         """解凍 Infinity 基礎模型的參數"""
         unfrozen_count = 0
         for name, param in self.named_parameters():
-            if not self._is_control_parameter(name):
+            if not any(car_prefix in name for car_prefix in ['car_', 'control_']):
                 param.requires_grad = True
                 unfrozen_count += 1
         print(f"Unfrozen {unfrozen_count} Infinity base model parameters")
 
-    def _init_control_modules(self):
-        """初始化控制模組：卷積特徵 + 多層門控融合。"""
+    def special_car_init(self, args):
+        """保留介面，不額外覆寫 Xavier 初始化。"""
+        print("[CAR init] Skipping special_car_init; using default Xavier initialization.")
+
+    def _init_car_parameters(self):
+        """為 CAR 子模組執行顯式初始化，避免未初始化權重導致數值異常。"""
+        def init_fn(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv2d):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, (nn.LayerNorm, FP32_Layernorm)):
+                if module.elementwise_affine:
+                    nn.init.ones_(module.weight)
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, FastRMSNorm):
+                if module.elementwise_affine:
+                    nn.init.ones_(module.weight)
+        
+        for block in self.car_blocks:
+            block.apply(init_fn)
+        self.car_skip_linear.apply(init_fn)
+
+    def _init_car_blocks_from_transformer(self):
+        """
+        用 Layer Merge 方式從 blocks 初始化 car_blocks
+        """
+        
+        step = self.depth // self.car_depth
+        
+        print(f"[car_init] merging from {self.depth} transformer blocks -> {self.car_depth} car blocks")
+        with torch.no_grad():
+            for i in range(self.car_depth):
+                merged = {}
+                idx_a = i * step
+                idx_b = min((i + 1) * step - 1, self.depth - 1)
+                wa = self.blocks[idx_a].state_dict()
+                wb = self.blocks[idx_b].state_dict()
+
+                for k in wa.keys():
+                    a = wa[k].float()
+                    b = wb[k].float()
+
+                    if torch.isnan(a).any() or torch.isinf(a).any():
+                        print(f"Warning: NaN or Inf detected in weights of block {idx_a}, key {k}")
+                        a = torch.nan_to_num(a)
+                        b = torch.nan_to_num(b)
+                    # 對 gating / scaling 參數採用偏淺層權重
+                    if "bias" in k:
+                        merged_v = torch.zeros_like(a)
+
+                    elif any(x in k for x in ["ada_gss", "scale_mul"]):
+                        merged_v = 1.0 * (0.8 * a + 0.2 * b)
+                    else:
+                        merged_v = 0.5 * (a + b)
+                    
+                    merged_v = torch.nan_to_num(merged_v)
+                    merged_v = torch.clamp(merged_v, -3.0, 3.0)
+                    merged[k] = merged_v.to(wa[k].dtype)
+
+                self.car_blocks[i].load_state_dict(merged)
+
+
+    def _init_car_modules(self):
+        """初始化 CAR(resnet) 控制模塊"""
+        # CAR control modules - 參考 CAR 的架構
         init_kwargs = getattr(self, '_init_kwargs', {})
-        control_in_channels = init_kwargs.get('control_condition_channels',
-                                              getattr(self, 'control_condition_channels', 3))
-        self.control_condition_channels = control_in_channels
+        conv_in_kernel = 3
+        conv_in_padding = (conv_in_kernel - 1) // 2
+        control_in_channels = init_kwargs.get('car_condition_channels', getattr(self, 'car_condition_channels', 3))
+        # self.car_control_convs = ControlConditionEmbedding(conditioning_embedding_channels=self.C, conditioning_channels=control_in_channels)
+        self.car_var_conv = nn.Conv2d(self.C, self.C, kernel_size=conv_in_kernel, padding=conv_in_padding)
+        nn.init.xavier_uniform_(self.car_var_conv.weight)
+        if self.car_var_conv.bias is not None:
+            nn.init.zeros_(self.car_var_conv.bias)
+        nn.init.xavier_uniform_(self.car_control_convs.conv_out.weight)
+        if self.car_control_convs.conv_out.bias is not None:
+            nn.init.zeros_(self.car_control_convs.conv_out.bias)
 
-        self.max_control_scales = init_kwargs.get('always_training_scales',
-                                                  getattr(self, 'always_training_scales', 20))
-        self.control_proj = nn.Linear(control_in_channels, self.C)
-        nn.init.xavier_uniform_(self.control_proj.weight)
-        if self.control_proj.bias is not None:
-            nn.init.zeros_(self.control_proj.bias)
-        self.control_scale_gates = nn.Parameter(torch.zeros(self.max_control_scales))
-        self.control_token_norm = FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True)
-        self._control_gate_grad_mask = torch.ones_like(self.control_scale_gates)
-        self.control_scale_gates.register_hook(self._control_gate_grad_hook)
+        # 建立 CAR 控制塊 - 只建立 depth//2 個塊（與 CAR 一致）
+        from functools import partial
+        
+        # Get parameters from kwargs or use defaults
+        norm_layer = partial(FastRMSNorm if init_kwargs.get('rms_norm', False) else nn.LayerNorm, eps=init_kwargs.get('norm_eps', 1e-6))
+        existing_depth = getattr(self, 'car_depth', None)
+        print(f"[debug] _init_car_modules called with kwargs.car_depth={init_kwargs.get('car_depth', None)} existing car_depth attr={existing_depth}")
 
-        print("[control_init] Initialized lightweight per-scale control projection.")
+        def _to_positive_int(val):
+            try:
+                iv = int(val)
+            except (TypeError, ValueError):
+                return None
+            return iv if iv > 0 else None
 
-    def has_control_modules(self):
-        """檢查是否已初始化控制模塊"""
-        return hasattr(self, 'control_proj')
+        init_depth = init_kwargs.get('car_depth', None)
+        chosen_depth = _to_positive_int(init_depth) or _to_positive_int(existing_depth)
+        if chosen_depth is None:
+            depth_val = _to_positive_int(getattr(self, 'depth', None))
+            chosen_depth = max(1, depth_val // 2) if depth_val is not None else 8
 
-    def has_car_modules(self):
-        # legacy alias
-        return self.has_control_modules()
+        self.car_depth = chosen_depth
+        print(f"[debug] CAR depth set to {self.car_depth}")
 
-    def _control_gate_grad_hook(self, grad: torch.Tensor) -> torch.Tensor:
-        mask = getattr(self, '_control_gate_grad_mask', None)
-        if mask is None:
-            return grad
-        if mask.device != grad.device:
-            mask = mask.to(grad.device)
-            self._control_gate_grad_mask = mask
-        return grad * mask
+        dpr = [x.item() for x in torch.linspace(0, init_kwargs.get('drop_path_rate', 0.0), self.car_depth)]
 
-    def set_control_gate_train_index(self, index: Optional[int]):
-        if not self.has_control_modules():
-            return
-        if index is None or index < 0:
-            mask = torch.zeros_like(self.control_scale_gates)
-        else:
-            mask = torch.zeros_like(self.control_scale_gates)
-            if index < mask.numel():
-                mask[index] = 1.0
-        self._control_gate_grad_mask = mask.to(self.control_scale_gates.device)
+        self.car_blocks = nn.ModuleList([
+            (CrossAttnBlock if self.t2i else SelfAttnBlock)(
+                embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=init_kwargs.get('cross_attn_layer_scale', -1.), 
+                cond_dim=self.D, act=True, shared_aln=init_kwargs.get('shared_aln', False), norm_layer=norm_layer,
+                num_heads=init_kwargs.get('num_heads', 16), mlp_ratio=init_kwargs.get('mlp_ratio', 4.), 
+                drop=init_kwargs.get('drop_rate', 0.), drop_path=dpr[block_idx], tau=init_kwargs.get('tau', 1), 
+                cos_attn=init_kwargs.get('cos_attn', True), swiglu=init_kwargs.get('swiglu', False), 
+                customized_flash_attn=getattr(self, 'customized_flash_attn', False), fused_mlp=init_kwargs.get('fused_mlp', False), 
+                fused_norm_func=getattr(self, '_fused_norm_func', None),
+                checkpointing_sa_only=getattr(self, 'checkpointing', None) == 'self-attn',
+                use_flex_attn=init_kwargs.get('use_flex_attn', False), batch_size=init_kwargs.get('batch_size', 2), 
+                pad_to_multiplier=init_kwargs.get('pad_to_multiplier', 0), 
+                rope2d_normalized_by_hw=init_kwargs.get('rope2d_normalized_by_hw', 0),
+            )
+            for block_idx in range(self.car_depth)
+        ])
 
-    def _combine_control_inputs(self, control_inputs: Optional[Dict[str, torch.Tensor]]) -> Optional[torch.Tensor]:
-        if control_inputs is None:
-            return None
-        tensors = []
-        if isinstance(control_inputs, dict):
-            keys = sorted(control_inputs.keys())
-            for key in keys:
-                tensor = control_inputs.get(key, None)
-                if tensor is None:
-                    continue
-                tensors.append(tensor)
-        elif isinstance(control_inputs, (list, tuple)):
-            tensors = [t for t in control_inputs if t is not None]
-        else:
-            tensors = [control_inputs]
+        # 建立跳躍連接的線性層與 RMSNorm，並確保初始化為零輸出
+        car_skip_linear = []
+        car_base_norms = []
+        car_ctrl_norms = []
+        for _ in range(self.car_depth):
+            car_skip_linear.append(nn.Linear(2 * self.C, self.C))
+            nn.init.xavier_uniform_(car_skip_linear[-1].weight)
+            if car_skip_linear[-1].bias is not None:
+                nn.init.zeros_(car_skip_linear[-1].bias)
+            car_base_norms.append(FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True))
+            car_ctrl_norms.append(FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True))
+        self.car_skip_linear = nn.ModuleList(car_skip_linear)
+        self.car_skip_base_norm = nn.ModuleList(car_base_norms)
+        self.car_skip_ctrl_norm = nn.ModuleList(car_ctrl_norms)
 
-        if not tensors:
-            return None
-
-        control = torch.cat(tensors, dim=1)
-        channel_gap = self.control_condition_channels - control.shape[1]
-        if channel_gap > 0:
-            pad = control.new_zeros(control.shape[0], channel_gap, control.shape[2], control.shape[3])
-            control = torch.cat([control, pad], dim=1)
-        elif channel_gap < 0:
-            control = control[:, :self.control_condition_channels]
-
-        return control
-
-    def build_control_tokens_from_inputs(
-        self,
-        control_inputs: Optional[Dict[str, torch.Tensor]],
-        scale_schedule: List[Tuple[int, int, int]],
-    ) -> Optional[List[Optional[torch.Tensor]]]:
-        """將控制輸入轉成各尺度的 token（會自動執行 conv + interpolation）。"""
-        if not self.has_control_modules():
-            return None
-        control_image = self._combine_control_inputs(control_inputs)
-        if control_image is None:
-            return None
-
-        control_image = control_image.to(self.control_storage_dtype)
-        control_tokens: List[Optional[torch.Tensor]] = []
-        for pn in scale_schedule:
-            if len(pn) == 3:
-                pt, ph, pw = pn
-            elif len(pn) == 2:
-                pt, ph, pw = 1, pn[0], pn[1]
-            else:
-                raise ValueError(f"Unexpected scale tuple: {pn}")
-
-            ph = int(ph)
-            pw = int(pw)
-            resized = F.interpolate(control_image, size=(ph, pw), mode='bilinear', align_corners=False)
-            tokens = resized.permute(0, 2, 3, 1).reshape(resized.shape[0], ph * pw, self.control_condition_channels)
-            tokens = self.control_proj(tokens)
-            if pt > 1:
-                tokens = tokens.unsqueeze(2).expand(-1, -1, int(pt)).reshape(tokens.shape[0], -1, tokens.shape[-1])
-            tokens = self.control_token_norm(tokens.to(self.control_runtime_dtype)).to(self.control_storage_dtype)
-            control_tokens.append(tokens)
-
-        return control_tokens
-
-    def _compute_control_offsets(self, scale_schedule: List[Tuple[int, int, int]]) -> List[Tuple[int, int]]:
-        offsets = []
-        ptr = 1
-        for pn in scale_schedule:
-            length = int(np.prod(pn))
-            offsets.append((ptr, ptr + length))
-            ptr += length
-        return offsets
-
-    def _add_control_to_sequence(
-        self,
-        seq: torch.Tensor,
-        control_tokens: Optional[List[Optional[torch.Tensor]]],
-        scale_offsets: Optional[List[Tuple[int, int]]],
-    ) -> torch.Tensor:
-        if not control_tokens or scale_offsets is None:
-            return seq
-        seqlen = seq.size(1)
-        for scale_idx, tokens in enumerate(control_tokens):
-            if tokens is None or scale_idx >= len(scale_offsets):
-                continue
-            start, end = scale_offsets[scale_idx]
-            seg_start = min(start, seqlen)
-            seg_end = min(end, seqlen)
-            if seg_end <= seg_start:
-                continue
-            seg_len = seg_end - seg_start
-            gate_idx = min(scale_idx, self.control_scale_gates.numel() - 1)
-            gate = torch.sigmoid(self.control_scale_gates[gate_idx]).to(seq.dtype)
-            seq[:, seg_start:seg_end, :].add_(gate * tokens[:, :seg_len, :].to(seq.dtype))
-        return seq
-
-
-    def init_control_modules_if_needed(self):
-        """如果尚未初始化則初始化控制模塊"""
-        if not self.has_control_modules():
-            self._init_control_modules()
-
-    def init_car_modules_if_needed(self):
-        # legacy alias
-        self.init_control_modules_if_needed()
+        # 分支正規化與殘差縮放，確保初期為微擾式調整
+        self.car_var_norm = FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True)
+        self.car_control_norm = FastRMSNorm(self.C, eps=1e-6, elementwise_affine=True)
+        self.car_skip_scale = nn.Parameter(torch.full((self.car_depth,), 1e-3))
+        
+        self._init_car_parameters()
+        print(f"Initialized CAR modules with {len(self.car_blocks)} control blocks")
     
-    def load_control_weights(self, control_state_dict: dict, strict=False):
-        """載入控制模塊的權重
+    def has_car_modules(self):
+        """檢查是否已初始化 CAR 模塊"""
+        return hasattr(self, 'car_control_convs')
+    
+    def init_car_modules_if_needed(self):
+        """如果尚未初始化則初始化 CAR 模塊"""
+        if not self.has_car_modules():
+            self._init_car_modules()
+    
+    def load_car_weights(self, car_state_dict: dict, strict=False):
+        """載入 CAR 模塊的權重
         Args:
-            control_state_dict: 控制模組的 state_dict
+            car_state_dict: CAR 模塊的 state_dict
             strict: 是否嚴格匹配參數名稱
         """
-        if not self.has_control_modules():
-            print("Control modules not initialized, initializing now...")
-            self._init_control_modules()
+        if not self.has_car_modules():
+            print("CAR modules not initialized, initializing now...")
+            self._init_car_modules()
         
-        # 規範 FSDP / module 前綴，確保鍵與當前模型一致
-        if any(key.startswith('block_chunks.') for key in control_state_dict.keys()):
-            print('[INFO] Detected FSDP block_chunks format for control weights, converting...')
-            converted = {}
-            for key, value in control_state_dict.items():
-                if key.startswith('block_chunks.'):
-                    parts = key.split('.')
-                    if len(parts) >= 4 and parts[2] == 'module':
-                        rest_path = '.'.join(parts[4:])
-                        if rest_path:
-                            converted[rest_path] = value
-                            continue
-                converted[key] = value
-            control_state_dict = converted
-
-        if any('._fsdp_wrapped_module.' in key or key.startswith('module.') for key in control_state_dict.keys()):
-            print('[INFO] Detected FSDP-wrapped control weights, normalizing key prefixes...')
-
-        normalized_state = {}
-        for key, value in control_state_dict.items():
-            normalized_key = None
-            for marker in ('car_', 'control_'):
-                idx = key.find(marker)
-                if idx != -1:
-                    normalized_key = key[idx:]
-                    break
-            if normalized_key is None:
-                continue
-            if normalized_key in normalized_state:
-                print(f"[WARN] Duplicate control key after normalization: {normalized_key}, keeping latest copy")
-            normalized_state[normalized_key] = value
-
-        if normalized_state:
-            control_state_dict = normalized_state
-
-        # 篩選出控制相關的參數
-        control_params = {}
+        # 篩選出 CAR 相關的參數
+        car_params = {}
         current_state_dict = self.state_dict()
         
         loaded_count = 0
         skipped_count = 0
         
-        for name, param in control_state_dict.items():
+        for name, param in car_state_dict.items():
             if any(car_prefix in name for car_prefix in ['car_', 'control_']):
                 if name in current_state_dict:
                     current_param = current_state_dict[name]
                     if current_param.shape == param.shape:
-                        control_params[name] = param
+                        car_params[name] = param
                         loaded_count += 1
                     else:
-                        print(f"Warning: Shape mismatch for control parameter {name}: expected {current_param.shape}, got {param.shape}")
+                        print(f"Warning: Shape mismatch for CAR parameter {name}: expected {current_param.shape}, got {param.shape}")
                         skipped_count += 1
                         if strict:
                             raise RuntimeError(f"Shape mismatch for {name}")
                 else:
-                    print(f"Warning: Control parameter {name} not found in current model")
+                    print(f"Warning: CAR parameter {name} not found in current model")
                     skipped_count += 1
                     if strict:
                         raise RuntimeError(f"Parameter {name} not found")
         
-        if control_params:
-            missing_keys, unexpected_keys = self.load_state_dict(control_params, strict=False)
-            print(f"Successfully loaded {loaded_count} control parameters")
+        if car_params:
+            missing_keys, unexpected_keys = self.load_state_dict(car_params, strict=False)
+            print(f"Successfully loaded {loaded_count} CAR parameters")
             if missing_keys:
-                print(f"Missing control keys: {len(missing_keys)}")
+                print(f"Missing CAR keys: {len(missing_keys)}")
             if unexpected_keys:
-                print(f"Unexpected control keys: {len(unexpected_keys)}")
+                print(f"Unexpected CAR keys: {len(unexpected_keys)}")
         else:
-            print("No matching control parameters found to load, using random initialization")
+            print("No matching CAR parameters found to load, using random initialization")
         
         if skipped_count > 0:
-            print(f"Skipped {skipped_count} control parameters due to mismatch")
+            print(f"Skipped {skipped_count} CAR parameters due to mismatch")
     
-    def load_car_weights(self, car_state_dict: dict, strict=False):
-        self.load_control_weights(car_state_dict, strict=strict)
-
-    def save_control_weights(self):
-        """保存控制模塊的權重
+    def save_car_weights(self):
+        """保存 CAR 模塊的權重
         Returns:
-            dict: 包含所有控制參數的字典
+            dict: 包含所有 CAR 參數的字典
         """
         car_state = {}
         for name, param in self.named_parameters():
             if any(car_prefix in name for car_prefix in ['car_', 'control_']):
                 car_state[name] = param.detach().cpu()
         return car_state
-
-    def save_car_weights(self):
-        return self.save_control_weights()
     
     def save_infinity_weights(self):
         """保存 Infinity 基礎模型的權重
@@ -716,16 +570,13 @@ class InfinityPilot(Infinity):
                 infinity_state[name] = param.detach().cpu()
         return infinity_state
     
-    def get_control_parameters(self):
-        """獲取所有控制模塊的參數"""
+    def get_car_parameters(self):
+        """獲取所有 CAR 模塊的參數"""
         car_params = []
         for name, param in self.named_parameters():
             if any(car_prefix in name for car_prefix in ['car_', 'control_']):
                 car_params.append(param)
         return car_params
-
-    def get_car_parameters(self):
-        return self.get_control_parameters()
     
     def get_infinity_parameters(self):
         """獲取所有 Infinity 基礎模型的參數"""
@@ -735,13 +586,68 @@ class InfinityPilot(Infinity):
                 infinity_params.append(param)
         return infinity_params
 
+    def set_control_tensors(self, control_tensors: List[torch.Tensor]):
+        """
+        設置控制條件張量
+        Args:
+            control_tensors: 控制條件張量列表，每個張量對應一個尺度
+        """
+        self.control_tensors = control_tensors
+
+    def prepare_control_for_scales(self, control_image: Union[torch.Tensor, Dict[str, torch.Tensor]], scale_schedule: List[Tuple[int]]) -> Optional[List[torch.Tensor]]:
+        """
+        為每個尺度準備控制條件
+        Args:
+            control_image: 原始控制圖像 [B, C, H, W] 或 dict 包含多種控制訊號
+            scale_schedule: 尺度排程
+        Returns:
+            每個尺度對應的控制張量列表
+        """
+        if isinstance(control_image, dict):
+            control_image = self._combine_control_inputs(
+                control_image.get('normal'),
+                control_image.get('mask')
+            )
+        if control_image is None:
+            return None
+        control_tensors = []
+        for pt, ph, pw in scale_schedule:
+            # 將控制圖像調整到對應尺度
+            target_size = (ph * 16, pw * 16)  # 假設每個patch是16x16
+            control_resized = F.interpolate(control_image, size=target_size, mode='bilinear', align_corners=False)
+            # 正規化到 [-1, 1]
+            if control_resized.min() >= 0 and control_resized.max() <= 1:
+                control_resized = control_resized * 2 - 1
+            control_tensors.append(control_resized)
+        return control_tensors
+
+    def _combine_control_inputs(self, normal_tensor: Optional[torch.Tensor], mask_tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """將多種控制訊號合併為固定通道數。"""
+        tensors = []
+        if normal_tensor is not None:
+            tensors.append(normal_tensor)
+        if mask_tensor is not None:
+            if mask_tensor.shape[1] == 1 and self.car_condition_channels > sum(t.shape[1] for t in tensors):
+                repeat = min(self.car_condition_channels - sum(t.shape[1] for t in tensors), 3)
+                mask_tensor = mask_tensor.repeat(1, repeat, 1, 1)
+            tensors.append(mask_tensor)
+        if not tensors:
+            return None
+        control = torch.cat(tensors, dim=1)
+        current_c = control.shape[1]
+        if current_c < self.car_condition_channels:
+            pad = self.car_condition_channels - current_c
+            control = torch.cat([control, control.new_zeros(control.shape[0], pad, control.shape[2], control.shape[3])], dim=1)
+        elif current_c > self.car_condition_channels:
+            control = control[:, :self.car_condition_channels]
+        return control
+
     def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC_wo_prefix: torch.Tensor, scale_schedule: List[Tuple[int]],
-        cfg_infer=False, control_tokens: Optional[List[Optional[torch.Tensor]]] = None,  **kwargs,
+        cfg_infer=False, control_tensors: Optional[List[torch.Tensor]] = None,  **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
 
-
         if cfg_infer:
-            return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, control_tokens=control_tokens, **kwargs)
+            return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, control_tensors=control_tensors, **kwargs)
         
         x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
         B = x_BLC_wo_prefix.shape[0]
@@ -766,7 +672,6 @@ class InfinityPilot(Infinity):
             
             sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
             x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
-            self._assert_finite("x_BLC_after_embed", x_BLC)
 
             # [1.1. pad the seqlen dim]
             l_end = x_BLC.shape[1]
@@ -798,15 +703,64 @@ class InfinityPilot(Infinity):
         else:
             attn_fn = None
 
-        prepared_control_tokens = None
-        control_offsets = None
-        if control_tokens is not None:
-            if isinstance(control_tokens, (list, tuple)):
-                prepared_control_tokens = control_tokens
-            else:
-                prepared_control_tokens = self.build_control_tokens_from_inputs(control_tokens, scale_schedule)
-        if prepared_control_tokens:
-            control_offsets = self._compute_control_offsets(scale_schedule)
+        # [1.2. 處理控制條件] - 參考 CAR 的處理方式
+        control_residual_f = []
+        if control_tensors is not None:
+            # 確保控制張量數量與尺度匹配
+            assert len(control_tensors) == len(scale_schedule), f"Expected {len(scale_schedule)} control tensors, got {len(control_tensors)}"
+            
+            # 處理第一個尺度的控制輸入（基於 sos）
+            ptr = 1  # 跳過 sos token
+            car_input_list = []
+            
+            for si, (pn, control_tensor) in enumerate(zip(scale_schedule, control_tensors)):
+                # 獲取這個尺度對應的 token
+                scale_seq_len = np.array(pn).prod()
+                if si == 0:
+                    # 第一個尺度使用 sos
+                    var_x = sos.transpose(1, 2).contiguous().reshape(B, self.C, 1, 1)  # 假設第一個尺度是 1x1
+                else:
+                    # 其他尺度使用對應的 tokens
+                    scale_tokens = x_BLC[:, ptr:ptr+scale_seq_len]
+                    ptr += scale_seq_len
+                    var_x = scale_tokens.transpose(1, 2).contiguous().reshape(B, self.C, pn[1], pn[2])
+                
+                # 通過 VAR 卷積
+                var_x = self.car_var_conv(var_x)
+                
+                # 處理控制條件
+                control_f = self.car_control_convs(control_tensor)
+                # 將控制特徵調整到正確尺寸
+                if control_f.shape[-2:] != var_x.shape[-2:]:
+                    control_f = F.interpolate(control_f, size=var_x.shape[-2:], mode='bilinear', align_corners=False)
+                
+                # 添加控制特徵
+                var_tokens = var_x.flatten(2).transpose(1, 2)
+                var_tokens = self.car_var_norm(var_tokens)
+                var_x = var_tokens.transpose(1, 2).reshape(B, self.C, *var_x.shape[-2:])
+
+                control_tokens = control_f.flatten(2).transpose(1, 2)
+                control_tokens = self.car_control_norm(control_tokens)
+                control_f = control_tokens.transpose(1, 2).reshape(B, self.C, *control_f.shape[-2:])
+
+                car_x = (var_x + control_f).view(B, self.C, -1).transpose(1, 2).contiguous()
+                car_input_list.append(car_x)
+            
+            # 連接所有尺度的控制輸入
+            car_input = torch.cat(car_input_list, dim=1)
+            
+            # 添加 level 和 position embedding
+            if need_to_pad:
+                car_input = F.pad(car_input, (0, 0, 0, need_to_pad))
+            car_input = self.add_lvl_embeding_for_x_BLC(car_input, scale_schedule, need_to_pad)
+            
+            # 通過 CAR 控制塊
+            for cb in self.car_blocks:
+                if self.checkpointing == 'full-block' and self.training:
+                    car_input = torch.utils.checkpoint.checkpoint(cb, car_input, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
+                else:
+                    car_input = cb(x=car_input, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid)
+                control_residual_f.append(car_input)
 
         # [2. block loop] - 修改以支援控制條件
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training
@@ -816,36 +770,43 @@ class InfinityPilot(Infinity):
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                if prepared_control_tokens and i == len(self.blocks) - 1:
-                    x_BLC = self._add_control_to_sequence(x_BLC, prepared_control_tokens, control_offsets)
+                
+                # 在後半部分塊中融合控制特徵 [TODO]
+                if control_tensors is not None and i >= len(self.blocks) - self.car_depth:
+                    skip_idx = i - (len(self.blocks) - self.car_depth) - 1
+                    if skip_idx < len(control_residual_f):
+                        con_f = control_residual_f[skip_idx]
+                        base_norm = self.car_skip_base_norm[skip_idx](x_BLC)
+                        ctrl_norm = self.car_skip_ctrl_norm[skip_idx](con_f)
+                        cat = torch.cat([base_norm, ctrl_norm], dim=-1)
+                        delta = (self.car_skip_linear[skip_idx](cat)*2 -1) / math.sqrt(32.0)
+                        scale = self.car_skip_scale[skip_idx].view(1, 1, 1)
+                        x_BLC = x_BLC + scale * delta
+                
                 if checkpointing_full_block:
                     x_BLC = torch.utils.checkpoint.checkpoint(b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
                 else:
                     x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid)
         else:
-            global_block_idx = 0
             for i, chunk in enumerate(self.block_chunks):
-                def fusion_cb(_idx, seq):
-                    return seq
                 if self.add_lvl_embeding_only_first_block and i == 0:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                if prepared_control_tokens and i == len(self.block_chunks) - 1:
-                    x_BLC = self._add_control_to_sequence(x_BLC, prepared_control_tokens, control_offsets)
-                x_BLC = chunk(
-                    x=x_BLC,
-                    cond_BD=cond_BD_or_gss,
-                    ca_kv=ca_kv,
-                    attn_bias_or_two_vector=attn_bias_or_two_vector,
-                    attn_fn=attn_fn,
-                    scale_schedule=scale_schedule,
-                    checkpointing_full_block=checkpointing_full_block,
-                    rope2d_freqs_grid=self.rope2d_freqs_grid,
-                    fusion_callback=fusion_cb,
-                    block_offset=global_block_idx,
-                )
-                global_block_idx += len(chunk.module)
+                
+                # 在後半部分塊中融合控制特徵
+                if control_tensors is not None and i >= self.num_block_chunks // 2:
+                    skip_idx = i - self.num_block_chunks // 2
+                    if skip_idx < len(control_residual_f):
+                        con_f = control_residual_f[skip_idx]
+                        base_norm = self.car_skip_base_norm[skip_idx](x_BLC)
+                        ctrl_norm = self.car_skip_ctrl_norm[skip_idx](con_f)
+                        cat = torch.cat([base_norm, ctrl_norm], dim=-1)
+                        delta = (self.car_skip_linear[skip_idx](cat)*2 -1) / math.sqrt(32.0)
+                        scale = self.car_skip_scale[skip_idx].view(1, 1, 1)
+                        x_BLC = x_BLC + scale * delta
+                
+                x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
 
         # [3. unpad the seqlen dim, and then get logits]
         return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
@@ -865,7 +826,7 @@ class InfinityPilot(Infinity):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
-        control_tokens: Optional[List[Optional[torch.Tensor]]] = None,
+        control_tensors: Optional[List[torch.Tensor]] = None,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -909,24 +870,32 @@ class InfinityPilot(Infinity):
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
         
-        prepared_control_tokens = None
-        control_offsets = None
-        if control_tokens is not None:
-            if isinstance(control_tokens, (list, tuple)):
-                prepared_control_tokens = control_tokens
-            else:
-                prepared_control_tokens = self.build_control_tokens_from_inputs(control_tokens, scale_schedule)
-        if prepared_control_tokens:
-            control_offsets = self._compute_control_offsets(scale_schedule)
-
+        # 預處理控制條件特徵
+        control_f = []
+        if control_tensors is not None:
+            assert len(control_tensors) == len(scale_schedule), f"Expected {len(scale_schedule)} control tensors, got {len(control_tensors)}"
+            for control_tensor in control_tensors:
+                # 確保控制張量的批次維度正確
+                if control_tensor.shape[0] != B:
+                    control_tensor = control_tensor.repeat(B, 1, 1, 1) if control_tensor.shape[0] == 1 else control_tensor[:B]
+                control_i = self.car_control_convs(control_tensor)
+                control_f.append(control_i)
+        
         # define model blocks
         if inference_mode:
             for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
+            for b in self.car_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
                     (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+            for block_chunk_ in self.car_blocks:
+                if hasattr(block_chunk_, 'module'):
+                    for module in block_chunk_.module.module:
+                        (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+                else:
+                    (block_chunk_.sa if isinstance(block_chunk_, CrossAttnBlock) else block_chunk_.attn).kv_caching(True)
         
         abs_cfg_insertion_layers = []
         add_cfg_on_logits, add_cfg_on_probs = False, False
@@ -945,6 +914,9 @@ class InfinityPilot(Infinity):
         num_stages_minus_1 = len(scale_schedule)-1
         summed_codes = 0
         
+        # 初始化控制分支的輸入
+        next_control_token_map = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
+        
         for si, pn in enumerate(scale_schedule):   # si: i-th segment
             cfg = cfg_list[si]
             if si >= trunk_scale:
@@ -956,27 +928,53 @@ class InfinityPilot(Infinity):
             if self.use_flex_attn:
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
 
-            # 處理控制條件分支
+            # 處理控制條件分支（參考 CAR 的做法）
+            control_residual_f = []
+            if control_tensors is not None:
+                # 準備控制分支的輸入
+                var_x = next_control_token_map.transpose(1, 2).contiguous().reshape(bs, self.C, pn[1], pn[2])
+                var_x = self.car_var_conv(var_x)
+                
+                # 添加控制特徵
+                control_x = control_f[si].repeat(bs//B, 1, 1, 1) if bs > B else control_f[si]
+                if control_x.shape[-2:] != var_x.shape[-2:]:
+                    control_x = F.interpolate(control_x, size=var_x.shape[-2:], mode='bilinear', align_corners=False)
+                
+                control_x = var_x + control_x
+                control_x = control_x.view(bs, self.C, -1).transpose(1, 2)
+                
+                # 添加位置嵌入
+                if self.add_lvl_embeding_only_first_block:
+                    control_x = self.add_lvl_embeding(control_x, si, scale_schedule, need_to_pad=need_to_pad)
+                
+                # 通過控制塊
+                for cb in self.car_blocks:
+                    control_x = cb(x=control_x, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                    control_residual_f.append(control_x)
 
             # 主分支處理
             layer_idx = 0
-            global_block_idx = 0
             for block_idx, b in enumerate(self.block_chunks):
                 if self.add_lvl_embeding_only_first_block and block_idx == 0:
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 if not self.add_lvl_embeding_only_first_block: 
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                if prepared_control_tokens and block_idx == len(self.block_chunks) - 1:
-                    last_stage = self._add_control_to_sequence(last_stage, prepared_control_tokens, control_offsets)
                 
                 for m in b.module:
+                    # 在後半部分融合控制特徵
+                    if control_tensors is not None and layer_idx >= len(self.unregistered_blocks) // 2:
+                        skip_idx = layer_idx - len(self.unregistered_blocks) // 2
+                        if skip_idx < len(control_residual_f):
+                            con_f = control_residual_f[skip_idx]
+                            cat = torch.cat([last_stage, con_f], dim=-1)
+                            cat = self.car_skip_norm[skip_idx](cat)
+                            last_stage = self.car_skip_linear[skip_idx](cat)
+                    
                     last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
                     
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
                         last_stage = torch.cat((last_stage, last_stage), 0)
-                    
-                    global_block_idx += 1
                     layer_idx += 1
             
             if (cfg != 1) and add_cfg_on_logits: # True
@@ -1034,14 +1032,23 @@ class InfinityPilot(Infinity):
             if si != num_stages_minus_1:
                 last_stage = self.word_embed(self.norm0_ve(last_stage))
                 last_stage = last_stage.repeat(bs//B, 1, 1)
+                # 同時更新控制分支的輸入
+                next_control_token_map = last_stage
 
         if inference_mode:
             for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
+            for b in self.car_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
                     (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+            for block_chunk_ in self.car_blocks:
+                if hasattr(block_chunk_, 'module'):
+                    for module in block_chunk_.module.module:
+                        (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+                else:
+                    (block_chunk_.sa if isinstance(block_chunk_, CrossAttnBlock) else block_chunk_.attn).kv_caching(False)
 
         if not ret_img:
             return ret, idx_Bl_list, []
@@ -1054,6 +1061,8 @@ class InfinityPilot(Infinity):
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
         return ret, idx_Bl_list, img
+
+
 
 def sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV: torch.Tensor, top_k: int = 0, top_p: float = 0.0, rng=None, num_samples=1) -> torch.Tensor:  # return idx, shaped (B, l)
     B, l, V = logits_BlV.shape

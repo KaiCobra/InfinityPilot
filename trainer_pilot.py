@@ -4,7 +4,7 @@ import gc
 import os.path as osp
 from functools import partial
 from pprint import pformat
-from typing import List, Optional, Tuple, Union, Dict
+from typing import List, Optional, Tuple, Union, Dict, Any
 from collections import defaultdict, deque
 
 import seaborn as sns
@@ -62,6 +62,23 @@ ITen = torch.LongTensor
 BTen = torch.BoolTensor
 fullstate_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 fulloptstate_save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+CONTROL_PARAM_FILTERS = (
+    'control_encoder',
+    'control_token_norm',
+    'control_scale_gate_mlp',
+    'control_scale_gate_bias',
+    'control_block_gates',
+    'car_control_encoder',
+    'car_control_norm',
+    'car_scale_gate_mlp',
+    'car_scale_gate_bias',
+    'car_block_fusion_gates',
+)
+CONTROL_NAME_PREFIXES = ('control_', 'car_')
+
+
+def is_control_param(name: str) -> bool:
+    return name.startswith(CONTROL_NAME_PREFIXES)
 
 class DynamicScaleManager:
     def __init__(
@@ -172,6 +189,10 @@ class InfinityPilotTrainer(object):
         print(f'self.reweight_loss_by_scale: {self.reweight_loss_by_scale}')
         self.text_tokenizer = None
         self.text_encoder = None
+        self.enable_training_visualizer = bool(getattr(other_args, 'enable_training_visualizer', False)) if other_args is not None else False
+        self.visualize_interval = max(1, int(getattr(other_args, 'visualize_interval', 100))) if self.enable_training_visualizer else 100
+        self.grad_monitor_enabled = bool(getattr(other_args, 'enable_grad_monitor', False)) if other_args is not None else False
+        self.grad_monitor_interval = max(1, int(getattr(other_args, 'grad_monitor_interval', 1000))) if self.grad_monitor_enabled else 1000
         self.last_train_loss: Optional[float] = None
         base_scale_limit = getattr(other_args, 'always_training_scales', 1) if other_args is not None else 1
         self.base_training_scale_limit = max(1, int(base_scale_limit))
@@ -200,29 +221,25 @@ class InfinityPilotTrainer(object):
                 loss_window=getattr(other_args, 'dynamic_scale_loss_window', 200),
             )
         
-        # Ensure CAR modules are initialized
+        # Ensure control modules are initialized
         gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-        if hasattr(gpt_uncompiled, 'has_car_modules'):
-            assert gpt_uncompiled.has_car_modules(), "CAR modules must be initialized before constructing the trainer"
+        control_check = getattr(gpt_uncompiled, 'has_control_modules', None)
+        if callable(control_check):
+            assert control_check(), "Control modules must be initialized before constructing the trainer"
+        elif hasattr(gpt_uncompiled, 'has_car_modules'):
+            assert gpt_uncompiled.has_car_modules(), "Control modules must be initialized before constructing the trainer"
         
-<<<<<<< ours
-        self._car_gradient_setup = False
-        self._setup_car_parameter_gradients()
-=======
         self._control_gradient_setup = False
         self._setup_control_parameter_gradients()
-<<<<<<< ours
         self._control_token_cache: Dict[str, Any] = {'key': None, 'tokens': None}
->>>>>>> theirs
-=======
->>>>>>> theirs
+        self._batch_feature_cache: Dict[str, Any] = {'key': None, 'data': None}
 
         # Print parameter counts (after gradient setup to reflect actual trainable stats)
-        car_params = sum(p.numel() for p in gpt_uncompiled.get_car_parameters() if p.requires_grad)
+        control_params = sum(p.numel() for p in gpt_uncompiled.get_control_parameters() if p.requires_grad)
         infinity_params = sum(p.numel() for p in gpt_uncompiled.get_infinity_parameters() if p.requires_grad)
-        print(f"Trainable CAR parameters: {car_params:,}")
+        print(f"Trainable control parameters: {control_params:,}")
         print(f"Trainable Infinity parameters: {infinity_params:,}")
-        print(f"Total trainable parameters: {car_params + infinity_params:,}")
+        print(f"Total trainable parameters: {control_params + infinity_params:,}")
         
         self.using_ema = ema_ratio != 0 and self.zero == 0
         self.ema_ratio = abs(ema_ratio)
@@ -286,23 +303,22 @@ class InfinityPilotTrainer(object):
         
         # Initialize parameter visualizer if available
         self.param_visualizer = None
-        if False:
-        # if VISUALIZER_AVAILABLE and dist.is_master() and False:
+        enable_param_vis = bool(getattr(other_args, 'enable_param_visualizer', False)) if other_args is not None else False
+        if VISUALIZER_AVAILABLE and enable_param_vis and dist.is_master():
             try:
-                # Get the underlying model without DDP/FSDP wrapper
                 underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
                 self.param_visualizer = ParameterChangeVisualizer(
-                    underlying_model, 
+                    underlying_model,
                     save_dir=f"./debug/param_visualizations_{time.strftime('%m%d_%H%M%S')}"
                 )
-                # print("✅ Parameter visualizer initialized")
             except Exception as e:
                 print(f"⚠️ Failed to initialize parameter visualizer: {e}")
                 self.param_visualizer = None
         
         # Initialize NaN detector if available
         self.nan_detector = None
-        if NAN_DETECTOR_AVAILABLE and getattr(other_args, 'enable_nan_detector', True):
+        enable_nan_detector = bool(getattr(other_args, 'enable_nan_detector', False)) if other_args is not None else False
+        if enable_nan_detector and NAN_DETECTOR_AVAILABLE:
             try:
                 underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
                 self.nan_detector = NaNDetector(underlying_model, check_backward=True, verbose=True)
@@ -311,36 +327,41 @@ class InfinityPilotTrainer(object):
             except Exception as e:
                 print(f"⚠️ Failed to initialize NaN detector: {e}")
                 self.nan_detector = None
+        elif enable_nan_detector:
+            print("⚠️ NaN detector requested but unavailable on this build.")
 
     def register_text_encoder(self, tokenizer, encoder):
         """Attach tokenizer and encoder for evaluation-time caption encoding."""
         self.text_tokenizer = tokenizer
         self.text_encoder = encoder
 
-    def _setup_car_parameter_gradients(self):
-        """Freeze Infinity parameters once so training only updates CAR components."""
+    def _setup_control_parameter_gradients(self):
+        """Freeze Infinity parameters once so training only updates control components."""
         gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-        if hasattr(gpt_uncompiled, 'has_car_modules'):
-            assert gpt_uncompiled.has_car_modules(), "CAR modules must be initialized before setting gradients."
+        control_check = getattr(gpt_uncompiled, 'has_control_modules', None)
+        if callable(control_check):
+            assert control_check(), "Control modules must be initialized before setting gradients."
+        elif hasattr(gpt_uncompiled, 'has_car_modules'):
+            assert gpt_uncompiled.has_car_modules(), "Control modules must be initialized before setting gradients."
         if getattr(gpt_uncompiled, '_gradient_setup_done', False):
-            self._car_gradient_setup = True
+            self._control_gradient_setup = True
             return
 
-        car_param_count = 0
+        control_param_count = 0
         infinity_param_count = 0
         for name, param in gpt_uncompiled.named_parameters():
-            if any(car_prefix in name for car_prefix in ['car_']):
+            if name.startswith(('control_', 'car_')):
                 param.requires_grad = True
-                car_param_count += 1
+                control_param_count += 1
             else:
                 param.requires_grad = False
                 infinity_param_count += 1
 
         if dist.is_master():
-            print(f"[Gradient Setup] CAR params (trainable): {car_param_count}, Infinity params (frozen): {infinity_param_count}")
+            print(f"[Gradient Setup] Control params (trainable): {control_param_count}, Infinity params (frozen): {infinity_param_count}")
 
         gpt_uncompiled._gradient_setup_done = True
-        self._car_gradient_setup = True
+        self._control_gradient_setup = True
     
     @torch.no_grad()
     def _generate_eval_visualization(self, ep: int, eval_images: List[torch.Tensor], 
@@ -378,10 +399,6 @@ class InfinityPilotTrainer(object):
                     h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
                     h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
                     scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
-                    if getattr(args, 'apply_spatial_patchify', False):
-                        vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
-                    else:
-                        vae_scale_schedule = scale_schedule
                     
                     text_kv, text_lens, text_cu, text_max = text_cond
                     text_tuple_device = (
@@ -393,7 +410,7 @@ class InfinityPilotTrainer(object):
 
                     control_tokens = None
                     if condition_gpu:
-                        control_tokens = self._build_control_tokens(condition_gpu, vae_scale_schedule, len(scale_schedule))
+                        control_tokens = self._build_control_tokens(condition_gpu, scale_schedule, len(scale_schedule))
                         if control_tokens is not None:
                             control_tokens = [t.to(device) if t is not None else None for t in control_tokens]
 
@@ -601,32 +618,6 @@ class InfinityPilotTrainer(object):
             full_scale_schedule = full_scale_schedule[:available_scales]
             gt_ms_idx_Bl = gt_ms_idx_Bl[:available_scales]
             
-            full_control_tokens = None
-<<<<<<< ours
-            raw_features_condition_mask = None
-            raw_features_condition_normal = None
-            if condition_inputs:
-                with torch.no_grad():
-                    if args.apply_spatial_patchify:
-                        vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in full_scale_schedule]
-                    else:
-                        vae_scale_schedule = full_scale_schedule
-                    if condition_inputs.get('mask') is not None:
-                        raw_features_condition_mask, _, _ = self.vae_local.encode_for_raw_features(condition_inputs['mask'], scale_schedule=vae_scale_schedule)
-                    if condition_inputs.get('normal') is not None:
-                        raw_features_condition_normal, _, _ = self.vae_local.encode_for_raw_features(condition_inputs['normal'], scale_schedule=vae_scale_schedule)
-                control_tokens_by_type = {}
-                if raw_features_condition_mask is not None:
-                    control_tokens_by_type['mask'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_mask)
-                if raw_features_condition_normal is not None:
-                    control_tokens_by_type['normal'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_normal)
-                if control_tokens_by_type:
-                    full_control_tokens = self._combine_control_tokens(control_tokens_by_type, len(full_scale_schedule))
-=======
-            if condition_inputs:
-                full_control_tokens = self._build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
->>>>>>> theirs
-            
             scale_limit = min(self.base_training_scale_limit, available_scales)
             training_scales = min(scale_limit, self.active_training_scales)
             if training_scales <= 0:
@@ -634,9 +625,7 @@ class InfinityPilotTrainer(object):
             self.last_training_scales = training_scales
             scale_schedule = full_scale_schedule[:training_scales]
             gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
-            control_tokens = None
-            if full_control_tokens is not None:
-                control_tokens = full_control_tokens[:training_scales]
+            control_tokens = self._get_or_build_control_tokens(condition_inputs, scale_schedule, training_scales)
             training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
             first_scale_tokens = int(np.prod(scale_schedule[0]))
             x_BLC_wo_prefix = x_BLC_wo_prefix_full[:, :(training_seq_len-first_scale_tokens), :]
@@ -717,46 +706,46 @@ class InfinityPilotTrainer(object):
         
         return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
 
-    def _build_control_tokens(self, condition_inputs: Optional[Dict[str, torch.Tensor]], vae_scale_schedule, training_scales):
+    def _build_control_tokens(self, condition_inputs: Optional[Dict[str, torch.Tensor]], scale_schedule, training_scales):
         if condition_inputs is None or len(condition_inputs) == 0:
             return None
-        control_tokens_by_type = {}
+        model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
+        has_control = getattr(model, 'has_control_modules', None)
+        if callable(has_control):
+            enabled = has_control()
+        elif hasattr(model, 'has_car_modules'):
+            enabled = model.has_car_modules()
+        else:
+            enabled = False
+        if not enabled:
+            return None
+        target_schedule = scale_schedule[:training_scales] if training_scales is not None else scale_schedule
         with torch.no_grad():
-<<<<<<< ours
-            if condition_inputs.get('mask') is not None:
-                mask = condition_inputs['mask']
-                raw_features_mask, _, _ = self.vae_local.encode_for_raw_features(mask, scale_schedule=vae_scale_schedule)
-                control_tokens_by_type['mask'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_mask)
-            if condition_inputs.get('normal') is not None:
-                normal = condition_inputs['normal']
-                raw_features_normal, _, _ = self.vae_local.encode_for_raw_features(normal, scale_schedule=vae_scale_schedule)
-                control_tokens_by_type['normal'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_normal)
-        if not control_tokens_by_type:
-            return None
-        return self._combine_control_tokens(control_tokens_by_type, training_scales)
+            return model.build_control_tokens_from_inputs(condition_inputs, target_schedule)
 
-<<<<<<< ours
-    @staticmethod
-    def _combine_control_tokens(control_tokens_by_type: Dict[str, List[torch.Tensor]], training_scales: int):
-        if not control_tokens_by_type:
+    def _make_condition_cache_key(self, condition_inputs: Optional[Dict[str, torch.Tensor]], scale_schedule) -> Optional[Tuple[Any, ...]]:
+        if not condition_inputs:
             return None
-        control_tokens = []
-        for si in range(training_scales):
-            tokens_at_scale = []
-            for tokens_list in control_tokens_by_type.values():
-                if si < len(tokens_list):
-                    tokens_at_scale.append(tokens_list[si])
-            if tokens_at_scale:
-                if len(tokens_at_scale) == 1:
-                    control_tokens.append(tokens_at_scale[0])
-                else:
-                    stacked = torch.stack(tokens_at_scale, dim=0)
-                    control_tokens.append(stacked.mean(dim=0))
-            else:
-                control_tokens.append(None)
-        return control_tokens
-    
-=======
+        descriptors = []
+        for name in sorted(condition_inputs.keys()):
+            tensor = condition_inputs[name]
+            if tensor is None or not isinstance(tensor, torch.Tensor):
+                continue
+            device = tensor.device
+            device_info = (device.type, device.index if device.type == 'cuda' else -1)
+            descriptors.append((
+                name,
+                int(tensor.data_ptr()),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                device_info,
+                str(tensor.dtype),
+            ))
+        if not descriptors:
+            return None
+        schedule_key = tuple(tuple(int(x) for x in pn) for pn in scale_schedule)
+        return (tuple(descriptors), schedule_key)
+
     def _get_or_build_control_tokens(self, condition_inputs, scale_schedule, training_scales):
         if condition_inputs is None or len(condition_inputs) == 0:
             return None
@@ -770,11 +759,28 @@ class InfinityPilotTrainer(object):
             return cached_tokens
         return tokens
 
->>>>>>> theirs
-=======
-            return model.build_control_tokens_from_inputs(condition_inputs, target_schedule)
+    def _make_batch_cache_key(self, inp_B3HW: torch.Tensor, condition_inputs: Optional[Dict[str, torch.Tensor]]) -> Optional[Tuple[Any, ...]]:
+        if not isinstance(inp_B3HW, torch.Tensor):
+            return None
+        key_components = [
+            ('inp', int(inp_B3HW.data_ptr()), tuple(inp_B3HW.shape), str(inp_B3HW.dtype),
+             (inp_B3HW.device.type, -1 if inp_B3HW.device.type == 'cpu' else inp_B3HW.device.index))
+        ]
+        if condition_inputs:
+            for name in sorted(condition_inputs.keys()):
+                tensor = condition_inputs[name]
+                if tensor is None or not isinstance(tensor, torch.Tensor):
+                    continue
+                dev = tensor.device
+                key_components.append((
+                    name,
+                    int(tensor.data_ptr()),
+                    tuple(tensor.shape),
+                    str(tensor.dtype),
+                    (dev.type, -1 if dev.type == 'cpu' else dev.index)
+                ))
+        return tuple(key_components)
 
->>>>>>> theirs
     @staticmethod
     def _slice_text_cond_for_eval(text_tuple, index: int) -> Optional[Tuple[torch.Tensor, List[int], torch.Tensor, int]]:
         if not isinstance(text_tuple, tuple) or len(text_tuple) != 4:
@@ -803,7 +809,12 @@ class InfinityPilotTrainer(object):
         V = self.vae_local.vocab_size
         device = inp_B3HW.device
         warmup_steps = self.logging_warmup_steps
-        should_visualize_batch = (it % 10 == 0 and dist.is_master())
+        should_visualize_batch = (
+            self.enable_training_visualizer
+            and dist.is_master()
+            and (self.visualize_interval > 0)
+            and (it % self.visualize_interval == 0)
+        )
         full_gt_ms_idx_Bl = None
 
         h_div_w = inp_B3HW.shape[-2] / inp_B3HW.shape[-1]
@@ -811,6 +822,7 @@ class InfinityPilotTrainer(object):
         h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
         full_scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
         full_scale_schedule = [(min(t, T//4+1), h, w) for (t, h, w) in full_scale_schedule]
+        batch_cache_key = self._make_batch_cache_key(inp_B3HW, condition_inputs)
         
 
         # [forward]
@@ -823,87 +835,68 @@ class InfinityPilotTrainer(object):
         #     print(f"❌ [it={it}] Inf in input inp_B3HW!")
         
         with self.gpt_opt.amp_ctx:
-<<<<<<< ours
-            # with torch.amp.autocast('cuda', enabled=False):
-            raw_features_condition_mask = None
-            raw_features_condition_normal = None
-=======
->>>>>>> theirs
-            with torch.no_grad():
+            cached_batch = None
+            if batch_cache_key is not None and self._batch_feature_cache.get('key') == batch_cache_key:
+                cached_batch = self._batch_feature_cache.get('data')
+
+            if cached_batch is not None:
+                full_scale_schedule = list(cached_batch['full_scale_schedule'])
+                full_vae_scale_schedule = list(cached_batch['full_vae_scale_schedule'])
+                raw_features = cached_batch['raw_features']
+                x_BLC_wo_prefix_full = cached_batch['x_BLC_wo_prefix_full']
+                gt_ms_idx_Bl_full = [tensor for tensor in cached_batch['gt_ms_idx_Bl_full']]
+                if should_visualize_batch:
+                    full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl_full]
+            else:
                 if args.apply_spatial_patchify:
                     full_vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in full_scale_schedule]
                 else:
                     full_vae_scale_schedule = full_scale_schedule
-                vae_scale_schedule = full_vae_scale_schedule
-                raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=vae_scale_schedule)
-<<<<<<< ours
-                # take out normal map and text mask condition if exists
-                # print('condition_inputs:', condition_inputs)
-                if condition_inputs is not None:
-                    if condition_inputs.get('mask') is not None:
-                        condition_mask = condition_inputs.get('mask')
-                        raw_features_condition_mask, _, _ = self.vae_local.encode_for_raw_features(condition_mask, scale_schedule=vae_scale_schedule) 
-                    if condition_inputs.get('normal') is not None:
-                        condition_normal = condition_inputs.get('normal')
-                        raw_features_condition_normal, _, _ = self.vae_local.encode_for_raw_features(condition_normal, scale_schedule=vae_scale_schedule)
+                with torch.no_grad():
+                    raw_features, _, _ = self.vae_local.encode_for_raw_features(inp_B3HW, scale_schedule=full_vae_scale_schedule)
 
-
-=======
->>>>>>> theirs
-
-            x_BLC_wo_prefix, gt_ms_idx_Bl = self.bitwise_self_correction.flip_requant(vae_scale_schedule, inp_B3HW, raw_features, device)
-            if should_visualize_batch:
-                full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl]
-<<<<<<< ours
-            control_tokens_by_type = {}
-            if raw_features_condition_mask is not None:
-                control_tokens_by_type['mask'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_mask)
-            if raw_features_condition_normal is not None:
-                control_tokens_by_type['normal'] = self.bitwise_self_correction.requant(vae_scale_schedule, raw_features_condition_normal)
-            full_control_tokens = None
-            if control_tokens_by_type:
-                full_control_tokens = self._combine_control_tokens(control_tokens_by_type, len(full_scale_schedule))
-=======
-            full_control_tokens = None
-            if condition_inputs:
-                full_control_tokens = self._build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
->>>>>>> theirs
+                x_BLC_wo_prefix_full, gt_ms_idx_Bl_full = self.bitwise_self_correction.flip_requant(full_vae_scale_schedule, inp_B3HW, raw_features, device)
+                if should_visualize_batch:
+                    full_gt_ms_idx_Bl = [tensor.clone() for tensor in gt_ms_idx_Bl_full]
+                if batch_cache_key is not None:
+                    self._batch_feature_cache = {
+                        'key': batch_cache_key,
+                        'data': {
+                            'full_scale_schedule': tuple(full_scale_schedule),
+                            'full_vae_scale_schedule': tuple(full_vae_scale_schedule),
+                            'raw_features': raw_features,
+                            'x_BLC_wo_prefix_full': x_BLC_wo_prefix_full,
+                            'gt_ms_idx_Bl_full': tuple(gt_ms_idx_Bl_full),
+                        }
+                    }
 
             # truncate scales
-            available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl))
+            available_scales = min(len(full_scale_schedule), len(gt_ms_idx_Bl_full))
             scale_limit = min(self.base_training_scale_limit, available_scales)
             training_scales = min(scale_limit, self.active_training_scales)
             if training_scales <= 0:
                 raise RuntimeError("No valid scales available; check VAE outputs or dynamic resolution settings.")
             self.last_training_scales = training_scales
             scale_schedule = full_scale_schedule[:training_scales]
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-            gt_ms_idx_Bl = gt_ms_idx_Bl[:training_scales]
-            control_tokens = None
-            if full_control_tokens is not None:
-                control_tokens = full_control_tokens[:training_scales]
-<<<<<<< ours
-=======
             gt_ms_idx_Bl = gt_ms_idx_Bl_full[:training_scales]
             control_tokens = self._get_or_build_control_tokens(condition_inputs, full_scale_schedule, len(full_scale_schedule))
             if control_tokens is not None:
                 control_tokens = control_tokens[:training_scales]
->>>>>>> theirs
-=======
->>>>>>> theirs
+
+            underlying_model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
+            if hasattr(underlying_model, 'set_control_gate_train_index'):
+                gate_idx = training_scales - 1 if training_scales > 0 else None
+                underlying_model.set_control_gate_train_index(gate_idx)
             training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
-            x_BLC_wo_prefix = x_BLC_wo_prefix[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
+            x_BLC_wo_prefix = x_BLC_wo_prefix_full[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
 
 
             # [forward]
             self.gpt_wo_ddp.forward  
             
 
-            if not self._car_gradient_setup:
-                self._setup_car_parameter_gradients()
+            if not self._control_gradient_setup:
+                self._setup_control_parameter_gradients()
             # print(f'scale_schedule: {scale_schedule}')
             logits_BLV = self.gpt(text_cond_tuple, x_BLC_wo_prefix, scale_schedule=scale_schedule, control_tokens=control_tokens) # [bs, 1*1+...+64*64, vocab_size or log2(vocab_size)*2]
             self.batch_size, self.seq_len = logits_BLV.shape[:2]
@@ -1001,26 +994,13 @@ class InfinityPilotTrainer(object):
         if args.use_fsdp_model_ema:
             update_ema(self.gpt_ema, self.gpt)
 
+        grad_stats = {}
         # [zero_grad]
         if stepping:
-<<<<<<< ours
-<<<<<<< ours
-            grad_stats = {}
-             # 梯度監控
-            if dist.is_master(): # 只在主進程執行
-=======
             self._control_token_cache = {'key': None, 'tokens': None}
-<<<<<<< ours
+            self._batch_feature_cache = {'key': None, 'data': None}
             log_grad_monitor = self.grad_monitor_enabled and (g_it % self.grad_monitor_interval == 0)
             if log_grad_monitor and dist.is_master(): # 只在主進程執行
->>>>>>> theirs
-=======
-=======
->>>>>>> theirs
-            grad_stats = {}
-             # 梯度監控
-            if dist.is_master(): # 只在主進程執行
->>>>>>> theirs
                 import matplotlib.pyplot as plt
                 import seaborn as sns
                 import pandas as pd
@@ -1047,22 +1027,16 @@ class InfinityPilotTrainer(object):
                     
                     grad_data.append({"module": name, "mean_abs_grad": mean_abs_grad})
 
-                # 1. 收集所有 CAR 模塊的梯度數據
-                if hasattr(model_to_check, 'car_control_proj'):
-                    collect_grad_stats('ControlProj', model_to_check.car_control_proj)
-                if hasattr(model_to_check, 'car_blocks'):
-                    for i, car_block in enumerate(model_to_check.car_blocks):
-                        collect_grad_stats(f'Block_{i:02d}', car_block)
-                if hasattr(model_to_check, 'car_output_norms'):
-                    for i, norm_layer in enumerate(model_to_check.car_output_norms):
-                        collect_grad_stats(f'OutputNorm_{i:02d}', norm_layer)
-                if hasattr(model_to_check, 'car_fusion_linears'):
-                    for i, linear_layer in enumerate(model_to_check.car_fusion_linears):
-                        collect_grad_stats(f'FusionLinear_{i:02d}', linear_layer)
-                if hasattr(model_to_check, 'car_fusion_scales'):
-                    collect_grad_stats('FusionScales', model_to_check.car_fusion_scales)
-                if hasattr(model_to_check, 'car_fusion_norms'):
-                    collect_grad_stats('FusionNorms', model_to_check.car_fusion_norms)
+                # 1. 收集控制分支模塊的梯度數據
+                encoder_module = getattr(model_to_check, 'control_encoder', None) or getattr(model_to_check, 'car_control_encoder', None)
+                norm_module = getattr(model_to_check, 'control_token_norm', None) or getattr(model_to_check, 'car_control_norm', None)
+                gate_module = getattr(model_to_check, 'control_scale_gate_mlp', None) or getattr(model_to_check, 'car_scale_gate_mlp', None)
+                if encoder_module is not None:
+                    collect_grad_stats('ControlEncoder', encoder_module)
+                if norm_module is not None:
+                    collect_grad_stats('ControlNorm', norm_module)
+                if gate_module is not None:
+                    collect_grad_stats('ScaleGateMLP', gate_module)
 
                 # 2. 如果收集到了數據，則繪圖並上傳
                 if grad_data:
@@ -1277,30 +1251,32 @@ class InfinityPilotTrainer(object):
                 # 分離 Infinity 和 CAR 的權重
                 full_state = self.gpt.state_dict()
                 infinity_state = {}
-                car_state = {}
-                
+                control_state = {}
+
                 for key, value in full_state.items():
-                    if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
-                        car_state[key] = value
+                    if any(key.startswith(prefix) for prefix in CONTROL_PARAM_FILTERS):
+                        control_state[key] = value
                     else:
                         infinity_state[key] = value
-                
+
                 state['gpt_fsdp'] = infinity_state  # 只存 Infinity 部分
-                state['car_fsdp'] = car_state       # 單獨存 CAR 部分
+                state['control_fsdp'] = control_state  # 單獨存 control 部分
+                state['car_fsdp'] = control_state      # legacy alias
                 
                 if self.use_fsdp_model_ema:
                     ema_full_state = self.gpt_ema.state_dict()
                     ema_infinity_state = {}
-                    ema_car_state = {}
-                    
+                    ema_control_state = {}
+
                     for key, value in ema_full_state.items():
-                        if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
-                            ema_car_state[key] = value
+                        if any(key.startswith(prefix) for prefix in CONTROL_PARAM_FILTERS):
+                            ema_control_state[key] = value
                         else:
                             ema_infinity_state[key] = value
-                    
+
                     state['gpt_ema_fsdp'] = ema_infinity_state
-                    state['car_ema_fsdp'] = ema_car_state
+                    state['control_ema_fsdp'] = ema_control_state
+                    state['car_ema_fsdp'] = ema_control_state
                 
                 state['gpt_fsdp_opt'] = FSDP.optim_state_dict(model=self.gpt, optim=self.gpt_opt.optimizer, optim_state_dict=self.gpt_opt.optimizer.state_dict())
             
@@ -1312,32 +1288,34 @@ class InfinityPilotTrainer(object):
                 self.ema_load()
                 full_ema_state = self.gpt_wo_ddp.state_dict()
                 ema_infinity_state = {}
-                ema_car_state = {}
-                
+                ema_control_state = {}
+
                 for key, value in full_ema_state.items():
-                    if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
-                        ema_car_state[key] = value.cpu()
+                    if any(key.startswith(prefix) for prefix in CONTROL_PARAM_FILTERS):
+                        ema_control_state[key] = value.cpu()
                     else:
                         ema_infinity_state[key] = value.cpu()
-                
+
                 state['gpt_ema_for_vis'] = ema_infinity_state
-                state['car_ema_for_vis'] = ema_car_state
+                state['control_ema_for_vis'] = ema_control_state
+                state['car_ema_for_vis'] = ema_control_state
                 self.ema_recover()
             
             # 分離當前狀態
             gpt_wo_ddp = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
             full_state = gpt_wo_ddp.state_dict()
             infinity_state = {}
-            car_state = {}
-            
+            control_state = {}
+
             for key, value in full_state.items():
-                if any(car_prefix in key for car_prefix in ['car_blocks', 'car_control_proj', 'car_fusion_linears', 'car_fusion_gates']):
-                    car_state[key] = value
+                if any(key.startswith(prefix) for prefix in CONTROL_PARAM_FILTERS):
+                    control_state[key] = value
                 else:
                     infinity_state[key] = value
-            
+
             state['gpt_wo_ddp'] = infinity_state  # 只存 Infinity 部分
-            state['car_wo_ddp'] = car_state       # 單獨存 CAR 部分
+            state['control_wo_ddp'] = control_state  # 單獨存 control 部分
+            state['car_wo_ddp'] = control_state      # legacy alias
             
             # 優化器狀態保持完整
             gpt_opt = self.gpt_opt._orig_mod if hasattr(self.gpt_opt, '_orig_mod') else self.gpt_opt
@@ -1345,49 +1323,57 @@ class InfinityPilotTrainer(object):
         
         return state
     
-    def load_state_dict(self, state, strict=True, skip_vae=False, car_ckpt_path=None):
-        # Ensure CAR modules are initialized before loading
+    def load_state_dict(self, state, strict=True, skip_vae=False, control_ckpt_path=None):
+        # Ensure control modules are initialized before loading
         gpt_uncompiled = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, '_orig_mod') else self.gpt_wo_ddp
-        if hasattr(gpt_uncompiled, 'has_car_modules'):
-            assert gpt_uncompiled.has_car_modules(), "CAR modules must be initialized before loading state"
+        control_check = getattr(gpt_uncompiled, 'has_control_modules', None)
+        if callable(control_check):
+            assert control_check(), "Control modules must be initialized before loading state"
+        elif hasattr(gpt_uncompiled, 'has_car_modules'):
+            assert gpt_uncompiled.has_car_modules(), "Control modules must be initialized before loading state"
         
         if self.zero:  # FSDP 模式
             with FSDP.state_dict_type(self.gpt, StateDictType.FULL_STATE_DICT, fullstate_save_policy, fulloptstate_save_policy):
-                # 載入完整的 state_dict（包含 Infinity + CAR）
-                if 'gpt_fsdp' in state:
-                    # 分離 Infinity 和 CAR 參數
-                    full_state = state['gpt_fsdp']
-                    infinity_state = {k: v for k, v in full_state.items() if not any(car_prefix in k for car_prefix in ['car_', 'control_'])}
-                    car_state = {k: v for k, v in full_state.items() if any(car_prefix in k for car_prefix in ['car_', 'control_'])}
-                    
-                    # 載入 Infinity 部分（強制載入）
+                infinity_state = state.get('gpt_fsdp', {})
+                control_state = state.get('control_fsdp') or state.get('car_fsdp')
+                if control_state is None and infinity_state:
+                    inferred_control = {k: v for k, v in infinity_state.items() if is_control_param(k)}
+                    if inferred_control:
+                        control_state = inferred_control
+                        infinity_state = {k: v for k, v in infinity_state.items() if not is_control_param(k)}
+
+                if infinity_state:
                     infinity_missing, infinity_unexpected = self.gpt.load_state_dict(infinity_state, strict=False)
                     print(f'[Infinity] missing: {len(infinity_missing)}, unexpected: {len(infinity_unexpected)}')
-                    
-                    # 載入 CAR 部分（如果存在）
-                    if car_state:
-                        car_missing, car_unexpected = self.gpt.load_state_dict(car_state, strict=False)
-                        print(f'[CAR] missing: {len(car_missing)}, unexpected: {len(car_unexpected)}')
-                    else:
-                        print('[CAR] No CAR weights in checkpoint, using random initialization')
-                
-                # 如果提供了單獨的 CAR checkpoint
-                if car_ckpt_path and osp.exists(car_ckpt_path):
-                    print(f'[CAR] Loading from separate file: {car_ckpt_path}')
-                    car_checkpoint = torch.load(car_ckpt_path, map_location='cpu')
-                    if hasattr(gpt_uncompiled, 'load_car_weights'):
-                        gpt_uncompiled.load_car_weights(car_checkpoint, strict=False)
-                
-                # EMA 處理
-                if self.use_fsdp_model_ema and 'gpt_ema_fsdp' in state:
-                    ema_state = state['gpt_ema_fsdp']
-                    infinity_ema_state = {k: v for k, v in ema_state.items() if not any(car_prefix in k for car_prefix in ['car_', 'control_'])}
-                    car_ema_state = {k: v for k, v in ema_state.items() if any(car_prefix in k for car_prefix in ['car_', 'control_'])}
-                    
-                    self.gpt_ema.load_state_dict(infinity_ema_state, strict=False)
-                    if car_ema_state:
-                        self.gpt_ema.load_state_dict(car_ema_state, strict=False)
-                
+
+                if control_state:
+                    control_missing, control_unexpected = self.gpt.load_state_dict(control_state, strict=False)
+                    print(f'[Control] missing: {len(control_missing)}, unexpected: {len(control_unexpected)}')
+                else:
+                    print('[Control] No control weights in checkpoint, using random initialization')
+
+                if control_ckpt_path and osp.exists(control_ckpt_path):
+                    print(f'[Control] Loading from separate file: {control_ckpt_path}')
+                    control_checkpoint = torch.load(control_ckpt_path, map_location='cpu')
+                    if hasattr(gpt_uncompiled, 'load_control_weights'):
+                        gpt_uncompiled.load_control_weights(control_checkpoint, strict=False)
+                    elif hasattr(gpt_uncompiled, 'load_car_weights'):
+                        gpt_uncompiled.load_car_weights(control_checkpoint, strict=False)
+
+                if self.use_fsdp_model_ema:
+                    ema_infinity_state = state.get('gpt_ema_fsdp', {})
+                    control_ema_state = state.get('control_ema_fsdp') or state.get('car_ema_fsdp')
+                    if control_ema_state is None and ema_infinity_state:
+                        inferred_control = {k: v for k, v in ema_infinity_state.items() if is_control_param(k)}
+                        if inferred_control:
+                            control_ema_state = inferred_control
+                            ema_infinity_state = {k: v for k, v in ema_infinity_state.items() if not is_control_param(k)}
+
+                    if ema_infinity_state:
+                        self.gpt_ema.load_state_dict(ema_infinity_state, strict=False)
+                    if control_ema_state:
+                        self.gpt_ema.load_state_dict(control_ema_state, strict=False)
+
                 # 優化器
                 if 'gpt_fsdp_opt' in state:
                     optim_state_dict = FSDP.optim_state_dict_to_load(
@@ -1404,29 +1390,31 @@ class InfinityPilotTrainer(object):
                     print(f'[fp16 load_state_dict err] {e}')
             self.gpt._reset_lazy_init()
         else:  # DDP 模式
-            # 載入完整的 state_dict
             if 'gpt_wo_ddp' in state:
-                full_state = state['gpt_wo_ddp']
-                infinity_state = {k: v for k, v in full_state.items() if not any(car_prefix in k for car_prefix in ['car_', 'control_'])}
-                car_state = {k: v for k, v in full_state.items() if any(car_prefix in k for car_prefix in ['car_', 'control_'])}
-                
-                # 載入 Infinity 部分
+                infinity_state = state['gpt_wo_ddp']
+                control_state = state.get('control_wo_ddp') or state.get('car_wo_ddp')
+                if control_state is None and infinity_state:
+                    inferred_control = {k: v for k, v in infinity_state.items() if is_control_param(k)}
+                    if inferred_control:
+                        control_state = inferred_control
+                        infinity_state = {k: v for k, v in infinity_state.items() if not is_control_param(k)}
+
                 infinity_missing, infinity_unexpected = gpt_uncompiled.load_state_dict(infinity_state, strict=False)
                 print(f'[Infinity] missing: {len(infinity_missing)}, unexpected: {len(infinity_unexpected)}')
-                
-                # 載入 CAR 部分
-                if car_state:
-                    car_missing, car_unexpected = gpt_uncompiled.load_state_dict(car_state, strict=False)
-                    print(f'[CAR] missing: {len(car_missing)}, unexpected: {len(car_unexpected)}')
+
+                if control_state:
+                    control_missing, control_unexpected = gpt_uncompiled.load_state_dict(control_state, strict=False)
+                    print(f'[Control] missing: {len(control_missing)}, unexpected: {len(control_unexpected)}')
                 else:
-                    print('[CAR] No CAR weights in checkpoint, using random initialization')
-            
-            # 如果提供了單獨的 CAR checkpoint
-            if car_ckpt_path and osp.exists(car_ckpt_path):
-                print(f'[CAR] Loading from separate file: {car_ckpt_path}')
-                car_checkpoint = torch.load(car_ckpt_path, map_location='cpu')
-                if hasattr(gpt_uncompiled, 'load_car_weights'):
-                    gpt_uncompiled.load_car_weights(car_checkpoint, strict=False)
+                    print('[Control] No control weights in checkpoint, using random initialization')
+
+            if control_ckpt_path and osp.exists(control_ckpt_path):
+                print(f'[Control] Loading from separate file: {control_ckpt_path}')
+                control_checkpoint = torch.load(control_ckpt_path, map_location='cpu')
+                if hasattr(gpt_uncompiled, 'load_control_weights'):
+                    gpt_uncompiled.load_control_weights(control_checkpoint, strict=False)
+                elif hasattr(gpt_uncompiled, 'load_car_weights'):
+                    gpt_uncompiled.load_car_weights(control_checkpoint, strict=False)
             
             # 載入優化器
             if 'gpt_opt' in state:
@@ -1439,6 +1427,8 @@ class InfinityPilotTrainer(object):
                     para_name = self.gpt_opt.names[pi]
                     if para_name in state['gpt_ema_for_vis']:
                         para.copy_(state['gpt_ema_for_vis'][para_name])
+                    elif 'control_ema_for_vis' in state and para_name in state['control_ema_for_vis']:
+                        para.copy_(state['control_ema_for_vis'][para_name])
                 print(f'[EMA] load succeed')
         
         # 載入配置
@@ -1492,23 +1482,23 @@ class InfinityPilotTrainer(object):
         # 分析参数状态
         infinity_trainable = []
         infinity_frozen = []
-        car_trainable = []
-        car_frozen = []
+        control_trainable = []
+        control_frozen = []
         infinity_in_optimizer = []
-        car_in_optimizer = []
+        control_in_optimizer = []
         
         for name, param in model_params.items():
             param_id = id(param)
-            is_car = any(prefix in name for prefix in ['car_', 'control_'])
+            is_control = is_control_param(name)
             is_in_optimizer = param_id in optimizer_param_ids
             
-            if is_car:
+            if is_control:
                 if param.requires_grad:
-                    car_trainable.append(name)
+                    control_trainable.append(name)
                     if is_in_optimizer:
-                        car_in_optimizer.append(name)
+                        control_in_optimizer.append(name)
                 else:
-                    car_frozen.append(name)
+                    control_frozen.append(name)
             else:  # Infinity参数
                 if param.requires_grad:
                     infinity_trainable.append(name)
@@ -1525,13 +1515,13 @@ class InfinityPilotTrainer(object):
             print()
             
             print(f"🔥 CAR MODULE STATUS:")
-            print(f"   CAR trainable: {len(car_trainable)}")
-            print(f"   CAR frozen: {len(car_frozen)}")
-            print(f"   CAR in optimizer: {len(car_in_optimizer)}")
-            if car_frozen:
-                print(f"   ❌ CAR frozen params (should be trainable): {car_frozen[:5]}")
-            if len(car_trainable) != len(car_in_optimizer):
-                print(f"   ❌ CAR trainable/optimizer mismatch!")
+            print(f"   Control trainable: {len(control_trainable)}")
+            print(f"   Control frozen: {len(control_frozen)}")
+            print(f"   Control in optimizer: {len(control_in_optimizer)}")
+            if control_frozen:
+                print(f"   ❌ Control frozen params (should be trainable): {control_frozen[:5]}")
+            if len(control_trainable) != len(control_in_optimizer):
+                print(f"   ❌ Control trainable/optimizer mismatch!")
             
             print(f"\n❄️  INFINITY MODULE STATUS:")
             print(f"   Infinity trainable: {len(infinity_trainable)}")
@@ -1575,10 +1565,10 @@ class InfinityPilotTrainer(object):
                     diff = torch.abs(current_tensor - prev_tensor).max().item()
                     
                     if diff > 1e-8:  # 检测到变化
-                        is_car = any(prefix in name for prefix in ['car_', 'control_'])
-                        status = "✅ Expected" if is_car else "❌ UNEXPECTED"
+                        is_control = is_control_param(name)
+                        status = "✅ Expected" if is_control else "❌ UNEXPECTED"
                         # print(f"   {status}: {name} changed by {diff:.2e}")
-                        if not is_car:
+                        if not is_control:
                             raise RuntimeError(f"Infinity parameter '{name}' changed during training!   {status}: {name} changed by {diff:.2e}")
         
         # update snapshot
@@ -1588,19 +1578,19 @@ class InfinityPilotTrainer(object):
         # Check gradient status
         # =================================================
         has_grad_infinity = 0
-        has_grad_car = 0
+        has_grad_control = 0
         no_grad_infinity = 0
-        no_grad_car = 0
+        no_grad_control = 0
         
         for name, param in model_params.items():
-            is_car = any(prefix in name for prefix in ['car_', 'control_'])
+            is_control = is_control_param(name)
             has_grad = param.grad is not None and param.grad.abs().sum() > 0
             
-            if is_car:
+            if is_control:
                 if has_grad:
-                    has_grad_car += 1
+                    has_grad_control += 1
                 else:
-                    no_grad_car += 1
+                    no_grad_control += 1
             else:
                 if has_grad:
                     has_grad_infinity += 1
