@@ -68,20 +68,22 @@ torchrun \
     --use_flex_attn=False \
     --pad=128 \
     --save_car_separately=True \
-    --car_depth=8 \
+    --car_depth=4 \
     --special_car_init=merge \
     --disable_car_fusion=False \
     --disable_car_merge=False \
     --rms_norm=True \
     --enable_checkpointing=full-block \
-    --initial_training_scales 7 \
+    --initial_training_scales 13 \
     --enable_dynamic_scales=True \
     --dynamic_scale_target 13 \
     --dynamic_scale_patience_transition 10 \
-    --dynamic_scale_patience_low=200 \
-    --dynamic_scale_patience_high=2000 \
-    --dynamic_scale_loss_window=150 \
+    --dynamic_scale_patience_low=10 \
+    --dynamic_scale_patience_high=20 \
+    --dynamic_scale_loss_window=10 \
     --dynamic_scale_loss_delta=5e-3 \
+    --car_block_lr_scale 0.4 \
+    --car_fusion_lr_scale 1.0 \
     # --car_resume_path=/media/avlab/f09873b9-7c6a-4146-acdb-7db847b573201/output_a6000_bsqvae_parallel_toy/car_weights_ep0007_it008000/car_weights.pth \
     # --enable_checkpointing=0 \
     # --sync_tensorboard=True,

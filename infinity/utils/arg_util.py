@@ -77,7 +77,9 @@ class Args(Tap):
     ca_gamma: float = -1                # >=0 for using layer-scale for cross attention
     diva: int = 1                       # rescale_attn_fc_weights
     hd0: float = 0.02                   # head.w *= hd0
-    car_lr_scale: float = 0.5           # learning-rate multiplier applied to CAR params
+    car_lr_scale: float = 1.0           # learning-rate multiplier applied to CAR params
+    car_fusion_lr_scale: float = 0.1    # learning-rate multiplier applied to CAR fusion params
+    car_block_lr_scale: float = 10.0    # learning-rate multiplier applied to CAR block params
     car_scale_reg: float = 5e-03        # L2 regularization weight for car_skip_scale
     min_warmup_iters: int = 2048        # minimum warmup iterations (in steps)
     car_condition_channels: int = 6     # number of channels for CAR condition input (normal map + mask)
@@ -269,6 +271,7 @@ class Args(Tap):
     # Ablasion studies
     car_depth:int = 4
     rms_norm:bool = True            # whether to use RMSNorm in CAR blocks [True, False]
+
     # fusion_scale_lr_scale:float = 0.01  # learning-rate multiplier applied to fusion scale parameters in CAR blocks
 
     # ==================================================================================================================

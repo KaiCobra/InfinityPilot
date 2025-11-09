@@ -1,4 +1,4 @@
-# train_pilot_11/9.py
+# train_pilot_ori.py
 import gc
 import json
 import math
@@ -127,7 +127,7 @@ def build_everything_from_args(args: arg_util.Args, saver):
     text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim = build_model_optimizer_nonused(args, vae_ckpt)
     
     # IMPORTANT: import heavy package `InfinityPilotTrainer` after the Dataloader object creation/iteration to avoid OOM
-    from trainer_pilot import InfinityPilotTrainer
+    from trainer_pilot_deepspeed import InfinityPilotTrainer
     # build trainer
     trainer = InfinityPilotTrainer(
         is_visualizer=dist.is_visualizer(), device=args.device, raw_scale_schedule=args.scale_schedule,

@@ -1,0 +1,9 @@
+{
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": true
+  },
+  "fp16": {
+    "enabled": true
+  }
+}
